@@ -79,7 +79,7 @@ const STALE_TTL_SECS: u32 = 30;
 
 /// Default budget for the estimated in-memory size of all cached
 /// entries. Sized against the ~270 MB of `MemoryMax` headroom measured
-/// above the reload peak (PERF.md): far more than a household working
+/// above the reload peak: far more than a household working
 /// set needs, small enough that a cache full of maximum-size answers
 /// cannot squeeze the reload peak.
 pub const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;

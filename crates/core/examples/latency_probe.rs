@@ -19,7 +19,7 @@
 //!
 //! ```sh
 //! cargo run --release -p sumidero-core --example latency_probe -- \
-//!   --names bench/names.txt --seed 1 \
+//!   --names names.txt --seed 1 \
 //!   'pool:https://dns.google/dns-query' \
 //!   'pool:https://dns.google/dns-query,https://dns.quad9.net/dns-query' \
 //!   udp:127.0.0.1:15353

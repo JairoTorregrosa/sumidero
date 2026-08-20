@@ -162,7 +162,7 @@ field is diagnostic, not a health signal.
 
 `MemoryMax=768M` in the shipped unit is sized from a measured reload
 peak (429 MB RSS / 491 MB cgroup at 3.29M rules, when the old and new
-engines briefly coexist). See `PERF.md`. With a much smaller rule set
+engines briefly coexist). With a much smaller rule set
 you can lower it; re-measure a SIGHUP reload on your own lists first,
 because the reload peak — not the steady state — is what has to fit.
 

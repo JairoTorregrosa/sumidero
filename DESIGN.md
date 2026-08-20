@@ -1,14 +1,13 @@
 # sumidero — design record
 
-Design phase closed 2026-08-19 and confirmed by the owner. The decisions below
-are settled; changing any of them requires an explicit owner decision, not a
-code review comment.
+Design phase closed 2026-08-19. The decisions below are settled; changing any
+of them requires an explicit maintainer decision, not a code review comment.
 
 ## Purpose
 
-Replace AdGuard Home on a Jetson Orin Nano (aarch64) serving house DNS.
-Priorities: correctness, operability by both humans and LLM agents through the
-CLI, and a small, auditable codebase.
+A DNS blocker for a home network, built to replace AdGuard Home and run
+unattended on small hardware. Priorities: correctness, operability by both
+humans and LLM agents through the CLI, and a small, auditable codebase.
 
 ## Scope (v1)
 
@@ -23,8 +22,8 @@ DHCP, web UI, HTTP API, Prometheus metrics, per-client rule sets.
 
 - A blocked query is answered **NXDOMAIN** with a synthetic SOA in the
   authority section (negative-caching friendly, unambiguous to clients).
-- AdGuard answers blocked queries with `0.0.0.0`. In shadow mode this
-  divergence is **expected** and auto-classified as such.
+- AdGuard Home answers blocked queries with `0.0.0.0`; shadow mode
+  auto-classifies that divergence as **expected**.
 - Exceptions (`@@`) always win over block rules.
 - `ANY` queries are refused.
 
@@ -96,12 +95,10 @@ defaults, no degraded half-running states that mask failures.
 
 - Native binary + hardened systemd unit: `DynamicUser=yes`,
   `CAP_NET_BIND_SERVICE`, `ProtectSystem=strict`, `MemoryMax`. Not docker.
-- Rollout: shadow mode on :5353 against the live AdGuard ≥ 48 h, divergences
-  triaged; cutover to :53 is the owner's explicit call.
+- Rollout: shadow mode on a high port against the incumbent resolver until
+  divergences are triaged; cutover to :53 is the operator's explicit call
+  (see `docs/CUTOVER.md`).
 
 ## Licensing / repo
 
-MIT. `github.com/JairoTorregrosa/sumidero`, private until shadow-validated,
-then public; `sumidero-filter` (then core) published to crates.io at v0.1.0
-with cargo-dist binaries for aarch64 and x86_64-musl. Code, docs, and commits
-in English.
+MIT. Code, docs, and commits in English.

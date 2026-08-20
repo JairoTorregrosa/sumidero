@@ -1,7 +1,8 @@
 //! Compact compiled matcher.
 //!
-//! Memory layout is optimized for millions of rules on small hosts (the
-//! deploy target is a shared 8GB Jetson): no per-node or per-rule heap
+//! Memory layout is optimized for millions of rules on small hosts
+//! (single-board computers with a few GB of shared RAM): no per-node or
+//! per-rule heap
 //! allocations. All rule text lives in one shared arena; subtree and
 //! exact rules are sorted key spans over byte arenas resolved by binary
 //! search. This replaced a HashMap-per-node label tree that cost ~400

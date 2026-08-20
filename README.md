@@ -45,8 +45,7 @@ SQLite log. No web UI.
 
 ## Numbers
 
-Measured on a 6-core aarch64 SBC with the full 3.3M-rule set; each
-figure's command and context is in [PERF.md](PERF.md).
+Measured on a 6-core aarch64 SBC with the full 3.3M-rule set.
 
 | what | measured |
 |---|---:|
@@ -57,11 +56,12 @@ figure's command and context is in [PERF.md](PERF.md).
 | cache hits under 6-thread contention | 740k lookups/s |
 | local burst, 64 clients | 7.4k qps, 0 dropped |
 
-On misses, answer latency is the upstream's, as for any forwarder;
-PERF.md documents that against the upstreams queried directly. Known
-failure modes found during validation (dead-connection reuse, hung
-upstreams, lying health counters, unbounded admission) each have a
-reproducing test in the suite.
+On misses, answer latency is the upstream's, as for any forwarder —
+verified against the same upstreams queried directly
+(`crates/core/examples/latency_probe.rs`). Known failure modes found
+during validation (dead-connection reuse, hung upstreams, lying health
+counters, unbounded admission) each have a reproducing test in the
+suite.
 
 ## Install
 
