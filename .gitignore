@@ -6,3 +6,4 @@ crates/filter/fuzz/artifacts
 *.sqlite-wal
 *.sqlite-shm
 .claude/
+/local/
