@@ -1,0 +1,32 @@
+[package]
+name = "sumidero"
+description = "DNS blocker with an agent-native CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "sumidero"
+path = "src/main.rs"
+
+[dependencies]
+sumidero-core = { path = "../core" }
+sumidero-filter = { path = "../filter" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+nix = { version = "0.30", features = ["signal"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ipnet = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

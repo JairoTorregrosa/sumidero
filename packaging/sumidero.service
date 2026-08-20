@@ -1,0 +1,69 @@
+[Unit]
+Description=sumidero DNS blocker
+Documentation=https://github.com/JairoTorregrosa/sumidero
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sumidero --config /etc/sumidero/config.toml serve
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+
+# --- identity -------------------------------------------------------
+# No package user to create or clean up; systemd allocates a transient
+# one and the state directory is chowned to it automatically.
+DynamicUser=yes
+# The one privilege a DNS server actually needs.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- filesystem -----------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# /var/lib/sumidero, created and owned automatically under DynamicUser.
+StateDirectory=sumidero
+StateDirectoryMode=0700
+# The database and the on-disk list copies are the only writable paths.
+ReadWritePaths=/var/lib/sumidero
+# Config is read-only; reloads come through SIGHUP, never self-edits.
+ConfigurationDirectory=sumidero
+
+# --- kernel and privilege surface -----------------------------------
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+# DNS over UDP/TCP plus DoH/DoQ upstreams; nothing else.
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# --- resources ------------------------------------------------------
+# Sized from the measured SIGHUP reload peak — 429 MB RSS / 491 MB
+# cgroup at 3.29M rules, when the old and new engines coexist — plus
+# margin for a refresh that re-downloads the lists. See PERF.md; do not
+# lower this without re-measuring a reload on the real rule set.
+MemoryMax=768M
+# glibc gives each thread its own arena; two is plenty for this
+# workload and keeps RSS predictable.
+Environment=MALLOC_ARENA_MAX=2
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

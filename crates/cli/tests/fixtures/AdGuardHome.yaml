@@ -1,0 +1,94 @@
+# Sanitized copy of the user's real AdGuardHome.yaml (same structure,
+# client IPs anonymized, credentials removed).
+http:
+  address: 0.0.0.0:80
+users:
+  - name: admin
+dns:
+  bind_hosts:
+    - 0.0.0.0
+  port: 53
+  ratelimit: 0
+  refuse_any: true
+  upstream_dns:
+    - https://dns.google/dns-query
+    - https://dns.quad9.net/dns-query
+    - quic://dns.adguard-dns.com
+  bootstrap_dns:
+    - 8.8.8.8
+    - 9.9.9.9
+    - 1.1.1.1
+  fallback_dns:
+    - https://dns.google/dns-query
+    - https://dns.quad9.net/dns-query
+  upstream_mode: parallel
+  allowed_clients:
+    - 192.168.0.0/24
+    - 127.0.0.1
+    - 100.100.100.100
+  disallowed_clients: []
+  blocked_hosts:
+    - version.bind
+    - id.server
+    - hostname.bind
+  cache_enabled: true
+  cache_ttl_min: 300
+  cache_optimistic: true
+  enable_dnssec: true
+  upstream_timeout: 5s
+  serve_plain_dns: true
+tls:
+  enabled: false
+querylog:
+  enabled: true
+statistics:
+  enabled: true
+filters:
+  - enabled: true
+    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+    name: AdGuard DNS filter
+    id: 1
+  - enabled: false
+    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt
+    name: AdAway Default Blocklist
+    id: 2
+  - enabled: true
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/pro.txt
+    name: Hagezi Pro - Ads and Trackers
+    id: 1771750270
+  - enabled: true
+    url: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/tif.txt
+    name: Hagezi TIF - Malware and Phishing
+    id: 1771750271
+  - enabled: true
+    url: https://nsfw.oisd.nl
+    name: OISD NSFW - Adult Content
+    id: 1771750272
+  - enabled: true
+    url: https://big.oisd.nl
+    name: OISD Big - Ads and Trackers
+    id: 1771750280
+  - enabled: false
+    url: https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts
+    name: StevenBlack Porn Hosts
+    id: 1771750273
+whitelist_filters: []
+user_rules:
+  - '@@||app.posthog.com^'
+  - '@@||sentry.io^'
+dhcp:
+  enabled: false
+filtering:
+  blocked_services:
+    ids: []
+  safe_search:
+    enabled: true
+    bing: true
+    duckduckgo: true
+    ecosia: true
+    google: false
+    pixabay: true
+    yandex: true
+    youtube: false
+  blocking_mode: default
+  rewrites: []

@@ -1,0 +1,8 @@
+/target
+crates/filter/fuzz/target
+crates/filter/fuzz/corpus
+crates/filter/fuzz/artifacts
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.claude/
