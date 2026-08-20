@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/img/logo.png" width="160" alt="sumidero logo"></p>
+
 # sumidero
 
 A DNS blocker for your network, in Rust. One binary, one TOML config, a
