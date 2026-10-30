@@ -17,6 +17,15 @@ allow = [
 
 [advisories]
 yanked = "deny"
+# Temporary, reviewed exception (2026-10-30). RUSTSEC-2024-0449 is an
+# "unmaintained" notice with no patched version. unsafe-libyaml is reached only
+# through serde_yaml in `sumidero migrate`, which parses an operator-supplied
+# AdGuardHome.yaml once; `serve` never parses YAML. Remove this entry when
+# serde_yaml is replaced by a maintained parser that meets the 7-day
+# minimum-age policy.
+ignore = [
+  { id = "RUSTSEC-2024-0449", reason = "unmaintained, no fix; only used by the one-shot `sumidero migrate` YAML import, never by `serve`; replace serde_yaml in a follow-up" },
+]
 
 [bans]
 multiple-versions = "warn"
