@@ -984,7 +984,9 @@ impl UpstreamPool {
                 upstreams.push(up);
             } else {
                 let factory = factories[i].take().expect("unconnected factory present");
-                upstreams.push(Arc::new(ReconnectingUpstream::disconnected(factory, timeout)));
+                upstreams.push(Arc::new(ReconnectingUpstream::disconnected(
+                    factory, timeout,
+                )));
             }
         }
         Ok(Self::assemble(upstreams, timeout))
@@ -1503,7 +1505,9 @@ mod tests {
         // a single unreachable upstream kept the whole pool from starting.
         let good: Arc<dyn Transport> = Arc::new(FakeTransport::ok(Duration::from_millis(1)));
         let factories: Vec<Box<dyn TransportFactory>> = vec![
-            Box::new(FailingFactory { label: "dead-upstream" }),
+            Box::new(FailingFactory {
+                label: "dead-upstream",
+            }),
             Box::new(StaticFactory {
                 transport: good,
                 label: "live-upstream".into(),
@@ -1517,7 +1521,11 @@ mod tests {
         .await
         .expect("pool must come up with one live upstream");
 
-        assert_eq!(pool.upstreams.len(), 2, "the dead upstream is kept, not dropped");
+        assert_eq!(
+            pool.upstreams.len(),
+            2,
+            "the dead upstream is kept, not dropped"
+        );
 
         let resp = pool
             .resolve(&test_query(4242))
@@ -1535,13 +1543,10 @@ mod tests {
             Box::new(FailingFactory { label: "dead-1" }),
             Box::new(FailingFactory { label: "dead-2" }),
         ];
-        let err = UpstreamPool::assemble_with_retry(
-            factories,
-            Duration::from_secs(5),
-            Duration::ZERO,
-        )
-        .await
-        .unwrap_err();
+        let err =
+            UpstreamPool::assemble_with_retry(factories, Duration::from_secs(5), Duration::ZERO)
+                .await
+                .unwrap_err();
         assert!(matches!(err, Error::Init(_)));
     }
 
