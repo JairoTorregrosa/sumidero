@@ -722,7 +722,7 @@ url = "https://example.com/extra.txt"
     fn safe_search_defaults_when_absent() {
         let cfg = Config::from_toml(&valid_toml(), &origin()).unwrap();
         assert!(!cfg.safe_search.enabled);
-        assert!(cfg.safe_search.providers.is_empty());
+        assert_eq!(cfg.safe_search.providers, [] as [String; 0]);
     }
 
     #[test]

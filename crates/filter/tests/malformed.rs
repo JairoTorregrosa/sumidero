@@ -37,8 +37,8 @@ fn empty_string_yields_empty_parsed_list() {
 #[test]
 fn blank_lines_produce_no_rules_no_issues() {
     let pl = parse_list("   \n\t\n  \t  \n\n");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
@@ -55,36 +55,36 @@ fn whitespace_only_line_is_skipped() {
 #[test]
 fn bang_comment_skipped() {
     let pl = parse_one("! this is a comment");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn hash_comment_skipped() {
     let pl = parse_one("# another comment");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn bang_comment_with_leading_whitespace_skipped() {
     let pl = parse_one("  ! indented comment");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn hash_comment_with_leading_whitespace_skipped() {
     let pl = parse_one("  # indented comment");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn multiple_comments_mixed() {
     let pl = parse_list("! first\n# second\n! third\n");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 // ===========================================================================
@@ -225,7 +225,7 @@ fn leading_hyphen_invalid_domain() {
 fn issues_carry_correct_one_based_line_numbers() {
     let input = "! comment\n\nexample.com##.banner\n||ads.example^$important\n/banner[0-9]+/\n";
     let pl = parse_list(input);
-    assert!(pl.rules.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
     assert_eq!(pl.issues.len(), 3);
 
     // Line 3: cosmetic
@@ -374,14 +374,14 @@ fn generic_cosmetic_rules_reported_not_swallowed() {
 fn hash_banner_and_hash_comments_still_skipped() {
     // `#` comments, `## text` headings, and `#####` banners are comments.
     let pl = parse_list("# comment\n## Section Title\n#########\n#\n##\n##\t x");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn domain_prefixed_snippet_rule_reported() {
     let pl = parse_list("example.com#%#//scriptlet('noop')");
-    assert!(pl.rules.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
     assert_eq!(pl.issues.len(), 1);
     assert_eq!(pl.issues[0].reason, IssueReason::CosmeticRule);
 }
@@ -411,27 +411,27 @@ fn wildcard_starred_segments_stay_unconstrained() {
     // Segments containing `*` are not label-validated; literal ones are.
     let pl = parse_list("||ads.*^\n*.tracker.com\ntr*ck.com\n*ad*.com");
     assert_eq!(pl.rules.len(), 4);
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn label_longer_than_63_bytes_rejected() {
     let long = "a".repeat(64);
     let pl = parse_list(&format!("||{long}.com^"));
-    assert!(pl.rules.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
     assert_eq!(pl.issues.len(), 1);
     assert_eq!(pl.issues[0].reason, IssueReason::InvalidDomain);
     // 63 bytes is still fine.
     let ok = "a".repeat(63);
     let pl = parse_list(&format!("||{ok}.com^"));
     assert_eq!(pl.rules.len(), 1);
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn trailing_hyphen_label_rejected() {
     let pl = parse_list("||trailinghyphen-.com^");
-    assert!(pl.rules.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
     assert_eq!(pl.issues.len(), 1);
     assert_eq!(pl.issues[0].reason, IssueReason::InvalidDomain);
 }
@@ -439,7 +439,7 @@ fn trailing_hyphen_label_rejected() {
 #[test]
 fn inner_caret_unsupported_syntax() {
     let pl = parse_list("||ex^ample.com^");
-    assert!(pl.rules.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
     assert_eq!(pl.issues.len(), 1);
     assert_eq!(pl.issues[0].reason, IssueReason::UnsupportedSyntax);
 }
@@ -448,17 +448,17 @@ fn inner_caret_unsupported_syntax() {
 fn underscore_domains_accepted() {
     let pl = parse_list("_dmarc.example.com\n||_srv.example.com^");
     assert_eq!(pl.rules.len(), 2);
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn punycode_treated_as_opaque_ascii() {
     let pl = parse_list("xn--bcher-kva.example");
     assert_eq!(pl.rules.len(), 1);
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
     // The Unicode form is not valid ASCII and is rejected, per contract.
     let pl = parse_list("bücher.example");
-    assert!(pl.rules.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
     assert_eq!(pl.issues.len(), 1);
     assert_eq!(pl.issues[0].reason, IssueReason::InvalidDomain);
 }

@@ -1182,7 +1182,7 @@ mod tests {
         assert_eq!(stats.upstream_failures, 1);
 
         // top_queried: first entry has count >= 2
-        assert!(!stats.top_queried.is_empty());
+        assert_ne!(stats.top_queried, [] as [(String, u64); 0]);
         assert_eq!(stats.top_queried[0].1, 2);
 
         // top_blocked: bad.com = 2
@@ -1424,6 +1424,9 @@ mod tests {
         let summary = db.divergence_summary(0).unwrap();
         assert_eq!(summary[0], ("expected".to_string(), 2));
         assert_eq!(summary[1], ("they-block-we-allow".to_string(), 1));
-        assert!(db.divergence_summary(2000).unwrap().is_empty());
+        assert_eq!(
+            db.divergence_summary(2000).unwrap(),
+            [] as [(String, u64); 0]
+        );
     }
 }

@@ -61,7 +61,7 @@ async fn start_on(binds: &[std::net::SocketAddr]) -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open(&tmp.path().join("e2e.sqlite")).unwrap();
     let parsed = parse_list("||blocked.test^");
-    assert!(parsed.issues.is_empty());
+    assert_eq!(parsed.issues, [] as [sumidero_filter::LineIssue; 0]);
     let mut builder = EngineBuilder::new();
     builder.add_list(parsed.rules);
     let pipeline = Pipeline::new(
@@ -90,7 +90,7 @@ async fn start() -> Env {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open(&tmp.path().join("e2e.sqlite")).unwrap();
     let parsed = parse_list("||blocked.test^");
-    assert!(parsed.issues.is_empty());
+    assert_eq!(parsed.issues, [] as [sumidero_filter::LineIssue; 0]);
     let mut builder = EngineBuilder::new();
     builder.add_list(parsed.rules);
     let pipeline = Pipeline::new(
