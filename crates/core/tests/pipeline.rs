@@ -660,7 +660,7 @@ async fn one_cache_entry_serves_both_do_and_plain_clients() {
         !has_rrsig(&resp),
         "cache hit leaked RRSIG to a DO-clear client"
     );
-    assert!(!resp.answers.is_empty());
+    assert_ne!(resp.answers, [] as [hickory_proto::rr::Record; 0]);
     assert_eq!(
         f.calls.load(Ordering::SeqCst),
         1,
@@ -889,5 +889,5 @@ async fn leader_panic_does_not_strand_future_queries() {
     .await
     .expect("a fresh miss after a leader panic must not hang");
     assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
-    assert!(!resp.answers.is_empty());
+    assert_ne!(resp.answers, [] as [hickory_proto::rr::Record; 0]);
 }

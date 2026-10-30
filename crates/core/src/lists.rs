@@ -895,7 +895,7 @@ mod tests {
                 assert_eq!(path, list_dir);
                 // The OS reason must survive to the operator, not be
                 // flattened into "does not exist or is not writable".
-                assert!(!source.to_string().is_empty());
+                assert_ne!(source.to_string(), "");
             }
             other => panic!("expected ListDirCreate, got {other}"),
         }

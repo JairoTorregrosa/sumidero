@@ -372,8 +372,8 @@ fn hosts_multiple_names_on_line_share_line_number() {
 #[test]
 fn broadcasthost_with_broadcast_ip_skipped_silently() {
     let pl = parse_list("255.255.255.255 broadcasthost");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
@@ -381,21 +381,21 @@ fn ipv6_multicast_localhost_machinery_skipped_silently() {
     let pl = parse_list(
         "ff00::0 ip6-localnet\nff00::0 ip6-mcastprefix\nff02::1 ip6-allnodes\nff02::2 ip6-allrouters",
     );
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn zone_id_loopback_localhost_skipped_silently() {
     let pl = parse_list("fe80::1%lo0 localhost");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn real_ip_with_real_hostname_still_reported() {
     let pl = parse_list("255.255.255.255 example.com");
-    assert!(pl.rules.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
     assert_eq!(pl.issues.len(), 1);
     assert_eq!(pl.issues[0].reason, IssueReason::UnsupportedHostsEntry);
 }
@@ -411,13 +411,13 @@ fn hosts_sink_ip_with_invalid_hostname_reported() {
 #[test]
 fn hosts_bare_ip_line_skipped_silently() {
     let pl = parse_list("0.0.0.0\n127.0.0.1");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
 
 #[test]
 fn ip6_allhosts_skipped_silently() {
     let pl = parse_list(":: ip6-allhosts");
-    assert!(pl.rules.is_empty());
-    assert!(pl.issues.is_empty());
+    assert_eq!(pl.rules, [] as [sumidero_filter::Rule; 0]);
+    assert_eq!(pl.issues, [] as [sumidero_filter::LineIssue; 0]);
 }
