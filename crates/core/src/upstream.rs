@@ -353,6 +353,20 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 /// other upstreams cover the gap.
 const MAX_REBUILD_HOLDDOWN: Duration = Duration::from_secs(5);
 
+/// At startup the network is often not routable yet (the NIC is still
+/// coming up) or one upstream is briefly unreachable. Treat that as a
+/// *transient* condition: keep retrying to connect the upstreams until at
+/// least one is live or this budget is spent. Only then does `new` give
+/// up and return `Error::Init`, so systemd restarts the process — the
+/// loud, visible process-level retry. This is deliberately NOT a silent
+/// fallback: a pool that came up serving zero upstreams would look
+/// healthy while resolving nothing.
+const INIT_MAX_RETRY: Duration = Duration::from_secs(30);
+/// First wait between startup connection rounds.
+const INIT_RETRY_BACKOFF_START: Duration = Duration::from_millis(500);
+/// Longest wait between startup connection rounds.
+const INIT_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
 /// The mutable connection state of one upstream.
 struct Slot {
     /// Bumped on every successful build; lets a task tell "the transport
@@ -449,7 +463,11 @@ struct ReconnectingUpstream {
 }
 
 impl ReconnectingUpstream {
-    /// Build the initial connection; failure here is fatal at startup.
+    /// Build the initial connection, failing if it cannot be established
+    /// within `build_timeout`. Test-only: production startup goes through
+    /// [`UpstreamPool::assemble_with_retry`], which retries and tolerates
+    /// an upstream that is down at boot.
+    #[cfg(test)]
     async fn connect(
         factory: Box<dyn TransportFactory>,
         build_timeout: Duration,
@@ -484,6 +502,35 @@ impl ReconnectingUpstream {
             reconnects: AtomicU64::new(0),
             consecutive_failures: AtomicU64::new(0),
             connected: AtomicBool::new(true),
+            last_success_ts: AtomicI64::new(0),
+        }
+    }
+
+    /// Wrap an upstream that has **not** connected yet.
+    ///
+    /// The slot starts empty with no back-off, so the first `acquire`
+    /// (or the pool's query fan-out) triggers a repair immediately and
+    /// the upstream joins the pool as soon as it becomes reachable. Used
+    /// at startup for upstreams that were unreachable while at least one
+    /// other upstream did come up: the pool must not lose them for the
+    /// lifetime of the process just because they were down at boot.
+    fn disconnected(factory: Box<dyn TransportFactory>, build_timeout: Duration) -> Self {
+        Self {
+            factory,
+            slot: RwLock::new(Slot {
+                generation: 0,
+                transport: None,
+                next_attempt: None,
+            }),
+            backoff_ms: AtomicU64::new(duration_to_millis(MIN_RECONNECT_BACKOFF)),
+            repairing: AtomicBool::new(false),
+            repair_done: tokio::sync::watch::Sender::new(0),
+            build_timeout,
+            queries: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
+            consecutive_failures: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
             last_success_ts: AtomicI64::new(0),
         }
     }
@@ -783,16 +830,29 @@ impl fmt::Debug for UpstreamPool {
 impl UpstreamPool {
     /// Build a new pool from configuration.
     ///
-    /// Every URL is validated, hostnames are resolved via the bootstrap
-    /// servers, and one transport is built per upstream. **Any** failure
-    /// is fatal — the pool refuses to partially initialise.
+    /// URLs are validated up front — a malformed/unsupported URL, or a
+    /// hostname upstream with no bootstrap servers, is a *configuration*
+    /// error and fails fast. Then every upstream is connected, retrying
+    /// with back-off for up to [`INIT_MAX_RETRY`]: the pool comes up as
+    /// soon as **at least one** upstream is live (this is what `resolve`
+    /// already needs — it races all upstreams and any one answering
+    /// wins). Upstreams still down when the pool comes up are kept as
+    /// self-healing [`ReconnectingUpstream::disconnected`] members and
+    /// rejoin automatically once reachable — a single dead upstream can
+    /// no longer keep the whole LAN's DNS server from starting.
+    ///
+    /// If **no** upstream can be reached within [`INIT_MAX_RETRY`], `new`
+    /// returns [`Error::Init`] and the process exits, so systemd restarts
+    /// it. That is deliberate: a DNS server that "came up" with zero
+    /// working upstreams would look healthy while resolving nothing, and
+    /// a loud crash-and-restart is always preferable to that.
     ///
     /// # Errors
     ///
     /// - [`Error::UnsupportedUrl`] if a URL is malformed or uses an
     ///   unsupported scheme.
-    /// - [`Error::Init`] if bootstrap resolution or transport creation
-    ///   fails for any upstream.
+    /// - [`Error::Init`] on empty/invalid config, or if no upstream could
+    ///   be connected within [`INIT_MAX_RETRY`].
     pub async fn new(cfg: &UpstreamConfig) -> Result<Self, Error> {
         if cfg.urls.is_empty() {
             return Err(Error::Init("no upstream URLs configured".into()));
@@ -802,20 +862,133 @@ impl UpstreamPool {
         }
 
         let timeout = Duration::from_millis(cfg.timeout_ms);
-        let mut upstreams: Vec<Arc<ReconnectingUpstream>> = Vec::with_capacity(cfg.urls.len());
 
+        // Validate every URL and build a factory per upstream. Config
+        // errors are fatal here — they are not transient, so retrying
+        // would only delay a crash that must happen anyway.
+        let mut factories: Vec<Box<dyn TransportFactory>> = Vec::with_capacity(cfg.urls.len());
         for raw_url in &cfg.urls {
             let kind = parse_upstream_url(raw_url)?;
-            let factory = NetworkFactory {
+            if cfg.bootstrap_ips.is_empty() {
+                let host = match &kind {
+                    UpstreamKind::Https { host, .. } | UpstreamKind::Quic { host, .. } => host,
+                };
+                if host.parse::<IpAddr>().is_err() {
+                    return Err(Error::Init(format!(
+                        "bootstrap_ips is empty and upstream '{raw_url}' requires resolution"
+                    )));
+                }
+            }
+            factories.push(Box::new(NetworkFactory {
                 kind,
                 bootstrap_ips: cfg.bootstrap_ips.clone(),
                 url: raw_url.clone(),
-            };
-            upstreams.push(Arc::new(
-                ReconnectingUpstream::connect(Box::new(factory), timeout).await?,
-            ));
+            }));
         }
 
+        Self::assemble_with_retry(factories, timeout, INIT_MAX_RETRY).await
+    }
+
+    /// Connect `factories`, retrying with back-off until at least one is
+    /// live or `budget` is spent, then assemble the pool. Live upstreams
+    /// join connected; the rest join disconnected and self-heal. Returns
+    /// [`Error::Init`] only if not a single upstream connects in `budget`.
+    ///
+    /// `factory.build()` borrows `&self`, so a failed factory can simply
+    /// be retried next round without being reconstructed.
+    async fn assemble_with_retry(
+        factories: Vec<Box<dyn TransportFactory>>,
+        timeout: Duration,
+        budget: Duration,
+    ) -> Result<Self, Error> {
+        let n = factories.len();
+        // `factories[i]` is taken once its upstream connects (moved into
+        // the live `ReconnectingUpstream`); `live[i]` holds the result.
+        let mut factories: Vec<Option<Box<dyn TransportFactory>>> =
+            factories.into_iter().map(Some).collect();
+        let mut live: Vec<Option<Arc<ReconnectingUpstream>>> = vec![None; n];
+
+        let started = Instant::now();
+        let mut backoff = INIT_RETRY_BACKOFF_START;
+        loop {
+            let mut errs: Vec<String> = Vec::new();
+            for i in 0..n {
+                if live[i].is_some() {
+                    continue;
+                }
+                // Scope the immutable borrow to the await so the slot can
+                // be taken mutably right after on success.
+                let built = {
+                    let factory = factories[i].as_ref().expect("pending factory present");
+                    tokio::time::timeout(timeout, factory.build()).await
+                };
+                match built {
+                    Ok(Ok(transport)) => {
+                        let factory = factories[i].take().expect("pending factory present");
+                        let label = factory.label().to_owned();
+                        live[i] = Some(Arc::new(ReconnectingUpstream::with_transport(
+                            factory, transport, timeout,
+                        )));
+                        tracing::info!(upstream = %label, "upstream connected at startup");
+                    }
+                    Ok(Err(e)) => {
+                        let label = factories[i].as_ref().map(|f| f.label().to_owned());
+                        tracing::warn!(
+                            upstream = label.as_deref().unwrap_or("?"),
+                            err = %e,
+                            "upstream not ready at startup; will retry"
+                        );
+                        errs.push(format!("{}: {e}", label.as_deref().unwrap_or("?")));
+                    }
+                    Err(_) => {
+                        let label = factories[i].as_ref().map(|f| f.label().to_owned());
+                        tracing::warn!(
+                            upstream = label.as_deref().unwrap_or("?"),
+                            "upstream connection timed out at startup; will retry"
+                        );
+                        errs.push(format!(
+                            "{}: initial connection timed out",
+                            label.as_deref().unwrap_or("?")
+                        ));
+                    }
+                }
+            }
+
+            let n_live = live.iter().filter(|u| u.is_some()).count();
+            if n_live > 0 {
+                if n_live < n {
+                    tracing::warn!(
+                        live = n_live,
+                        total = n,
+                        "upstream pool starting with some upstreams down; they will self-heal"
+                    );
+                }
+                break;
+            }
+
+            if started.elapsed() >= budget {
+                return Err(Error::Init(format!(
+                    "no upstream could be connected within {budget:?}; giving up (the process \
+                     will exit and systemd will restart it): {}",
+                    errs.join("; ")
+                )));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(INIT_RETRY_BACKOFF_MAX);
+        }
+
+        // Assemble: live upstreams as connected, the rest as self-healing.
+        let mut upstreams: Vec<Arc<ReconnectingUpstream>> = Vec::with_capacity(n);
+        for i in 0..n {
+            if let Some(up) = live[i].take() {
+                upstreams.push(up);
+            } else {
+                let factory = factories[i].take().expect("unconnected factory present");
+                upstreams.push(Arc::new(ReconnectingUpstream::disconnected(
+                    factory, timeout,
+                )));
+            }
+        }
         Ok(Self::assemble(upstreams, timeout))
     }
 
@@ -1167,6 +1340,22 @@ mod tests {
         msg
     }
 
+    /// A factory whose every `build` fails — an upstream that is
+    /// unreachable at startup (connection refused / timed out).
+    struct FailingFactory {
+        label: &'static str,
+    }
+
+    impl TransportFactory for FailingFactory {
+        fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
+            Box::pin(async { Err(Error::Init("connection refused (test)".to_owned())) })
+        }
+
+        fn label(&self) -> &str {
+            self.label
+        }
+    }
+
     // ── URL validation tests ────────────────────────────────────────
 
     #[test]
@@ -1304,6 +1493,60 @@ mod tests {
             timeout_ms: 5000,
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
+        assert!(matches!(err, Error::Init(_)));
+    }
+
+    #[tokio::test]
+    async fn pool_comes_up_when_at_least_one_upstream_connects() {
+        // One upstream is dead at startup, one is live. The pool must
+        // come up (not crash), keep BOTH members (the dead one as a
+        // self-healing disconnected upstream), and resolve via the live
+        // one. This is the regression test for the Aug-21 outage, where
+        // a single unreachable upstream kept the whole pool from starting.
+        let good: Arc<dyn Transport> = Arc::new(FakeTransport::ok(Duration::from_millis(1)));
+        let factories: Vec<Box<dyn TransportFactory>> = vec![
+            Box::new(FailingFactory {
+                label: "dead-upstream",
+            }),
+            Box::new(StaticFactory {
+                transport: good,
+                label: "live-upstream".into(),
+            }),
+        ];
+        let pool = UpstreamPool::assemble_with_retry(
+            factories,
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("pool must come up with one live upstream");
+
+        assert_eq!(
+            pool.upstreams.len(),
+            2,
+            "the dead upstream is kept, not dropped"
+        );
+
+        let resp = pool
+            .resolve(&test_query(4242))
+            .await
+            .expect("query resolves via the live upstream");
+        assert_eq!(resp.metadata.id, 4242);
+    }
+
+    #[tokio::test]
+    async fn pool_crashes_when_no_upstream_connects() {
+        // Every upstream is unreachable and the startup budget is spent:
+        // `new` must return Err (the process exits, systemd restarts it)
+        // rather than come up serving nothing.
+        let factories: Vec<Box<dyn TransportFactory>> = vec![
+            Box::new(FailingFactory { label: "dead-1" }),
+            Box::new(FailingFactory { label: "dead-2" }),
+        ];
+        let err =
+            UpstreamPool::assemble_with_retry(factories, Duration::from_secs(5), Duration::ZERO)
+                .await
+                .unwrap_err();
         assert!(matches!(err, Error::Init(_)));
     }
 
