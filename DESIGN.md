@@ -25,7 +25,13 @@ DHCP, web UI, HTTP API, Prometheus metrics, per-client rule sets.
 - AdGuard Home answers blocked queries with `0.0.0.0`; shadow mode
   auto-classifies that divergence as **expected**.
 - Exceptions (`@@`) always win over block rules.
+- CNAME chains are judged too: an answer whose chain reaches a blocked
+  name is replaced by the block NXDOMAIN (an exception on the queried
+  name covers its chain).
 - `ANY` queries are refused.
+- The full per-query contract is [docs/SEMANTICS.md](docs/SEMANTICS.md);
+  every runtime state machine is in
+  [docs/STATE-MACHINES.md](docs/STATE-MACHINES.md).
 
 ## Stack
 
@@ -38,20 +44,23 @@ DHCP, web UI, HTTP API, Prometheus metrics, per-client rule sets.
 
 ## Workspace
 
-Single repo, three crates, one shipped binary.
+Single repo, four crates, one shipped binary.
 
 - **`crates/filter`** — pure, no I/O, publishable standalone.
   - Parser: ABP-DNS subset — `||domain^`, exact domains, `@@` exceptions,
     wildcards, hosts-file lines. Cosmetic/element-hiding rules are rejected
     with a warning, never silently dropped.
-  - Matcher: inverted label tree; exceptions win; case-insensitive;
-    trailing-dot insensitive.
+  - Matcher: sorted, deduplicated reversed-label key indexes for exact
+    and subtree rules; wildcards bucketed by the labels after their last
+    `*`; exceptions win; case-insensitive; trailing-dot insensitive.
   - Owns the fuzz targets and criterion benches.
 - **`crates/core`** — daemon library.
   - UDP/TCP server on :53 (binds v4+v6), client-IP allowlist.
   - Pipeline: filter → safe-search rewrite → cache → parallel DoH/DoQ
     upstreams (bootstrap resolution, per-upstream timeout).
-  - Cache: own LRU, min TTL 300 s, optimistic serve-stale.
+  - Cache: own LRU; fresh exactly as long as the published TTL; serve-stale
+    up to 12 h (RFC 8767, configurable); resolution failures held down
+    5–60 s (RFC 9520).
   - DNSSEC v1: set the DO bit, trust the validating upstream.
   - SQLite writer: query log, aggregate stats, shadow divergences, runtime
     heartbeat row (PID, started-at, list hashes, config hash). Retention
@@ -59,8 +68,11 @@ Single repo, three crates, one shipped binary.
   - Shadow mode: also forward each query to a reference resolver, compare
     verdict + rcode class, record divergences.
 - **`crates/cli`** — binary `sumidero`: `serve`, `status`, `log`, `stats`,
-  `explain`, `check`, `reload` (= `check` then SIGHUP), `init --profile`,
-  `migrate`, `shadow report`.
+  `explain`, `check`, `reload` (SIGHUP, then wait for the daemon's
+  outcome), `init --profile`, `migrate`, `shadow report`.
+- **`crates/testkit`** — test support only: real local DoH/DoQ/UDP
+  upstreams (hickory-server), an HTTPS list host and a throwaway CA. Tests
+  talk to these over real sockets; there are no mock upstreams.
 
 ## Control plane: the filesystem is the API
 
@@ -68,8 +80,9 @@ Single repo, three crates, one shipped binary.
   named blocklists; every list individually overridable.
 - The CLI reads state from SQLite directly; `explain` warns when its list
   hash differs from the daemon's heartbeat row.
-- Reload = `sumidero check` (validate) then SIGHUP to the daemon (nginx
-  pattern). No control socket, no HTTP, no web UI in v1.
+- Reload = SIGHUP to the daemon (the CLI refuses a config that does not
+  parse), and the daemon writes the outcome to SQLite, which `reload`
+  waits for. No control socket, no HTTP, no web UI in v1.
 - `migrate` converts an `AdGuardHome.yaml` one-shot.
 
 ## Agent-native CLI contract
@@ -87,9 +100,15 @@ defaults, no degraded half-running states that mask failures.
 
 ## Lists
 
-- Update every 24 h with ETag/If-None-Match; always keep the last good disk
-  copy; a fetch failure with a disk copy present logs loudly and serves the
-  copy.
+- Update every 24 h (hourly while a list fails) with ETag/If-None-Match;
+  always keep the last good disk copy; a fetch failure with a disk copy
+  present serves the copy and makes `status` report `list_fetch_failed`
+  (and `list_stale` after 3 days).
+- List hosts are resolved through the encrypted upstreams, never the host
+  resolver: a filtering host resolver must not be able to starve the
+  filter of its own lists.
+- Start-up uses the stored copies and downloads afterwards; only a list
+  with no copy at all makes start-up wait for the network.
 
 ## Deployment
 
