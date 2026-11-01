@@ -1,131 +1,212 @@
 //! Compact compiled matcher.
 //!
-//! Memory layout is optimized for millions of rules on small hosts
-//! (single-board computers with a few GB of shared RAM): no per-node or
-//! per-rule heap
-//! allocations. All rule text lives in one shared arena; subtree and
-//! exact rules are sorted key spans over byte arenas resolved by binary
-//! search. This replaced a HashMap-per-node label tree that cost ~400
-//! bytes per rule; the arena layout costs ~65 bytes plus the text
-//! itself (measured on the real 3.3M-rule list set).
+//! Layout, chosen for millions of rules on a small shared-memory host:
 //!
-//! Subtree matching uses reversed-label keys: `doubleclick.net` is
-//! stored as `net.doubleclick`, and a query matches if any of its
-//! reversed label-boundary prefixes equals a stored key.
+//! - **Key indexes** (exact and subtree): structure-of-arrays over one
+//!   byte arena, sorted by key and deduplicated, so a domain that several
+//!   lists block is stored once. Subtree keys are reversed labels
+//!   (`doubleclick.net` → `net.doubleclick`); a query probes each of its
+//!   reversed label-boundary prefixes with a binary search.
+//! - **Rule store**: per rule only list, line, flags and a text span.
+//!   Canonical rule texts (`||d^`, `@@||d^`, `d`, `@@d`, `0.0.0.0 d`) are
+//!   not stored: they are rebuilt from the key on the (rare) match that
+//!   needs them. Only non-canonical texts live in the verbatim arena.
+//! - **Wildcards**: indexed by the complete labels after their last `*`
+//!   (`ads.*.example.com` → `example.com`). A wildcard can only match a
+//!   name that ends with that suffix at a label boundary, so a query
+//!   checks only the buckets of its own label suffixes plus the few
+//!   wildcards that end in `*`. Before this, every query ran every
+//!   wildcard glob: 94% of verdict time on the production rule set.
 
-use crate::{MatchedRule, Pattern, Rule, RuleAction, Verdict};
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use crate::parse::{PatternRef, RuleRef};
+use crate::{MatchedRule, RuleAction, Verdict};
+
+const FLAG_EXCEPT: u8 = 1;
+/// Text form, bits 1..=3.
+const FORM_SHIFT: u8 = 1;
+const FORM_VERBATIM: u8 = 0;
+/// `||domain^` (`@@` prefix when excepted); key = reversed domain.
+const FORM_SUBTREE: u8 = 1;
+/// `domain` (`@@` prefix when excepted); key = domain.
+const FORM_EXACT: u8 = 2;
+/// `domain^` (`@@` prefix when excepted); key = domain.
+const FORM_EXACT_CARET: u8 = 3;
+/// `0.0.0.0 domain`; key = domain.
+const FORM_HOSTS_ZERO: u8 = 4;
 
 /// Per-rule metadata, parallel arrays indexed by rule id.
 #[derive(Debug, Default)]
 struct Store {
-    /// All rule texts, concatenated.
-    text_arena: String,
-    /// Prefix offsets into `text_arena`; rule `i` owns `off[i]..off[i+1]`.
-    text_off: Vec<u32>,
-    lines: Vec<u32>,
     lists: Vec<u16>,
-    /// 0 = block, 1 = except.
-    actions: Vec<u8>,
+    lines: Vec<u32>,
+    flags: Vec<u8>,
+    /// Offset/length into the verbatim arena (verbatim form) or into the
+    /// key arena of the rule's index (canonical forms).
+    span_off: Vec<u32>,
+    span_len: Vec<u8>,
+    verbatim: String,
 }
 
 impl Store {
-    fn push(&mut self, list: u16, rule: &Rule) -> u32 {
+    fn push(&mut self, list: u16, line: u32, except: bool, form: u8) -> u32 {
         let id = u32::try_from(self.lines.len()).expect("more than u32::MAX rules");
-        self.text_arena.push_str(&rule.text);
-        self.text_off
-            .push(u32::try_from(self.text_arena.len()).expect("text arena exceeds 4GB"));
-        self.lines.push(rule.line);
         self.lists.push(list);
-        self.actions
-            .push(u8::from(rule.action == RuleAction::Except));
+        self.lines.push(line);
+        self.flags.push(u8::from(except) | (form << FORM_SHIFT));
+        self.span_off.push(0);
+        self.span_len.push(0);
         id
     }
 
-    fn matched(&self, id: u32) -> (usize, MatchedRule<'_>) {
-        let i = id as usize;
-        let start = if i == 0 {
-            0
-        } else {
-            self.text_off[i - 1] as usize
-        };
-        let end = self.text_off[i] as usize;
-        let action = if self.actions[i] == 0 {
-            RuleAction::Block
-        } else {
-            RuleAction::Except
-        };
-        (
-            usize::from(self.lists[i]),
-            MatchedRule {
-                action,
-                text: &self.text_arena[start..end],
-                line: self.lines[i],
-            },
-        )
+    fn set_span(&mut self, id: u32, off: u32, len: usize) {
+        self.span_off[id as usize] = off;
+        self.span_len[id as usize] = u8::try_from(len).expect("rule span over 255 bytes");
+    }
+
+    fn push_verbatim(&mut self, id: u32, text: &str) {
+        let off = u32::try_from(self.verbatim.len()).expect("verbatim arena exceeds 4GB");
+        self.verbatim.push_str(text);
+        // Rule texts are DNS names plus a few markers; anything longer is
+        // truncated for display only (matching never reads this).
+        let len = text.len().min(255);
+        let len = (0..=len)
+            .rev()
+            .find(|&l| text.is_char_boundary(l))
+            .unwrap_or(0);
+        self.set_span(id, off, len);
     }
 
     fn is_except(&self, id: u32) -> bool {
-        self.actions[id as usize] == 1
+        self.flags[id as usize] & FLAG_EXCEPT != 0
+    }
+
+    fn form(&self, id: u32) -> u8 {
+        self.flags[id as usize] >> FORM_SHIFT
     }
 
     fn len(&self) -> usize {
         self.lines.len()
     }
+
+    fn heap_bytes(&self) -> usize {
+        self.lists.capacity() * 2
+            + self.lines.capacity() * 4
+            + self.flags.capacity()
+            + self.span_off.capacity() * 4
+            + self.span_len.capacity()
+            + self.verbatim.capacity()
+    }
 }
 
-/// Sorted map from byte keys to rule ids, all keys in one arena.
-/// Duplicate keys are allowed (same domain in several lists, or a block
-/// and an exception on one domain) and stored adjacently after the sort.
+/// Sorted, deduplicated byte keys → rule ids. Structure of arrays: a
+/// 9-byte entry instead of a padded 12-byte tuple.
 #[derive(Debug, Default)]
 struct KeyIndex {
     arena: Vec<u8>,
-    /// (key offset, key len, rule id), sorted by key bytes after `build`.
-    entries: Vec<(u32, u32, u32)>,
+    offs: Vec<u32>,
+    lens: Vec<u8>,
+    rules: Vec<u32>,
 }
 
 impl KeyIndex {
     fn insert(&mut self, key: &[u8], rule: u32) {
         let off = u32::try_from(self.arena.len()).expect("key arena exceeds 4GB");
         self.arena.extend_from_slice(key);
-        self.entries
-            .push((off, u32::try_from(key.len()).expect("key too long"), rule));
+        self.offs.push(off);
+        self.lens
+            .push(u8::try_from(key.len()).expect("DNS names are at most 253 bytes"));
+        self.rules.push(rule);
     }
 
-    fn key(&self, entry: (u32, u32, u32)) -> &[u8] {
-        &self.arena[entry.0 as usize..(entry.0 + entry.1) as usize]
+    fn key(&self, i: usize) -> &[u8] {
+        let off = self.offs[i] as usize;
+        &self.arena[off..off + usize::from(self.lens[i])]
     }
 
-    fn sort(&mut self) {
-        let arena = std::mem::take(&mut self.arena);
-        self.entries
-            .sort_unstable_by(|&a, &b| key_of(&arena, a).cmp(key_of(&arena, b)));
-        self.arena = arena;
-    }
+    /// Sort by key, then rebuild the arena with each distinct key once.
+    /// Calls `relocate(rule, new_off)` so rules that borrow their text
+    /// from this arena follow their key.
+    fn finish(&mut self, mut relocate: impl FnMut(u32, u32)) {
+        let n = self.rules.len();
+        let mut order: Vec<u32> = (0..u32::try_from(n).expect("index too large")).collect();
+        order.sort_unstable_by(|&a, &b| self.key(a as usize).cmp(self.key(b as usize)));
 
-    /// All rule ids whose key equals `needle`, in insertion-sorted order.
-    fn equal_range<'a>(&'a self, needle: &'a [u8]) -> impl Iterator<Item = u32> + 'a {
-        let start = self.entries.partition_point(|&e| self.key(e) < needle);
-        self.entries[start..]
-            .iter()
-            .take_while(move |&&e| self.key(e) == needle)
-            .map(|&(_, _, rule)| rule)
-    }
-}
-
-fn key_of(arena: &[u8], e: (u32, u32, u32)) -> &[u8] {
-    &arena[e.0 as usize..(e.0 + e.1) as usize]
-}
-
-/// `doubleclick.net` → `net.doubleclick` (labels reversed, dots kept).
-fn reversed_labels(domain: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(domain.len());
-    for label in domain.rsplit('.') {
-        if !out.is_empty() {
-            out.push(b'.');
+        let mut arena = Vec::with_capacity(self.arena.len() / 2);
+        let mut offs = Vec::with_capacity(n);
+        let mut lens = Vec::with_capacity(n);
+        let mut rules = Vec::with_capacity(n);
+        let mut prev: Option<(usize, u32)> = None; // (sorted pos, new off)
+        for (pos, &i) in order.iter().enumerate() {
+            let i = i as usize;
+            let new_off = match prev {
+                Some((p, off)) if self.key(order[p] as usize) == self.key(i) => off,
+                _ => {
+                    let off = u32::try_from(arena.len()).expect("key arena exceeds 4GB");
+                    arena.extend_from_slice(self.key(i));
+                    prev = Some((pos, off));
+                    off
+                }
+            };
+            offs.push(new_off);
+            lens.push(self.lens[i]);
+            rules.push(self.rules[i]);
+            relocate(self.rules[i], new_off);
         }
-        out.extend_from_slice(label.as_bytes());
+        arena.shrink_to_fit();
+        *self = Self {
+            arena,
+            offs,
+            lens,
+            rules,
+        };
     }
-    out
+
+    /// Rule ids whose key equals `needle`.
+    fn equal_range<'a>(&'a self, needle: &'a [u8]) -> impl Iterator<Item = u32> + 'a {
+        let lo = partition_point(self.rules.len(), |i| self.key(i) < needle);
+        (lo..self.rules.len())
+            .take_while(move |&i| self.key(i) == needle)
+            .map(move |i| self.rules[i])
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.arena.capacity()
+            + self.offs.capacity() * 4
+            + self.lens.capacity()
+            + self.rules.capacity() * 4
+    }
+}
+
+/// `partition_point` over an index range (the keys are not a slice).
+fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Write `domain`'s labels in reverse order into `out`
+/// (`doubleclick.net` → `net.doubleclick`); returns the length.
+fn reverse_labels_into(domain: &[u8], out: &mut [u8]) -> usize {
+    let mut w = 0;
+    for label in domain.rsplit(|&b| b == b'.') {
+        if w > 0 {
+            out[w] = b'.';
+            w += 1;
+        }
+        out[w..w + label.len()].copy_from_slice(label);
+        w += label.len();
+    }
+    w
 }
 
 #[derive(Debug)]
@@ -135,6 +216,15 @@ struct WildcardEntry {
     rule: u32,
 }
 
+/// The complete labels after a wildcard's last `*`: the suffix every
+/// name it can match must end with, at a label boundary.
+fn wildcard_anchor(expr: &str) -> Option<&str> {
+    let tail = &expr[expr.rfind('*')? + 1..];
+    let dot = tail.find('.')?;
+    let anchor = &tail[dot + 1..];
+    (!anchor.is_empty()).then_some(anchor)
+}
+
 /// Compiled matcher for a set of parsed lists.
 #[derive(Debug, Default)]
 pub struct Engine {
@@ -142,6 +232,10 @@ pub struct Engine {
     subtree: KeyIndex,
     exact: KeyIndex,
     wildcards: Vec<WildcardEntry>,
+    /// Anchor suffix → wildcard indexes.
+    wildcard_buckets: HashMap<Box<str>, Vec<u32>>,
+    /// Wildcards with no anchor (`ads.example.*`): checked for every name.
+    wildcard_unanchored: Vec<u32>,
     list_count: usize,
 }
 
@@ -154,47 +248,123 @@ impl Engine {
         list
     }
 
-    /// Compact one rule into the current list.
-    pub(crate) fn add_rule(&mut self, rule: &Rule) {
-        let list_u16 =
-            u16::try_from(self.list_count.saturating_sub(1)).expect("more than u16::MAX lists");
-        let id = self.store.push(list_u16, rule);
+    /// Compact one rule into the current list, copying only what is kept.
+    pub(crate) fn add_rule(&mut self, rule: &RuleRef<'_>) {
+        let list = u16::try_from(self.list_count.saturating_sub(1)).expect("too many lists");
+        let except = rule.action == RuleAction::Except;
+        let body = if except {
+            rule.text.strip_prefix("@@").unwrap_or(rule.text)
+        } else {
+            rule.text
+        };
         match &rule.pattern {
-            Pattern::Exact(domain) => self.exact.insert(domain.as_bytes(), id),
-            Pattern::Subtree(domain) => self.subtree.insert(&reversed_labels(domain), id),
-            Pattern::Wildcard {
+            PatternRef::Subtree(domain) => {
+                let canonical = body
+                    .strip_prefix("||")
+                    .and_then(|b| b.strip_suffix('^'))
+                    .is_some_and(|d| d == domain.as_ref());
+                let form = if canonical {
+                    FORM_SUBTREE
+                } else {
+                    FORM_VERBATIM
+                };
+                let id = self.store.push(list, rule.line, except, form);
+                let mut buf = [0u8; 256];
+                let n = reverse_labels_into(domain.as_bytes(), &mut buf);
+                self.subtree.insert(&buf[..n], id);
+                if !canonical {
+                    self.store.push_verbatim(id, rule.text);
+                }
+            }
+            PatternRef::Exact(domain) => {
+                let form = if body == domain.as_ref() {
+                    FORM_EXACT
+                } else if body.strip_suffix('^').is_some_and(|d| d == domain) {
+                    FORM_EXACT_CARET
+                } else if !except
+                    && body
+                        .strip_prefix("0.0.0.0")
+                        .is_some_and(|d| d.len() == domain.len() + 1 && d[1..] == **domain)
+                    && body.as_bytes()[7] == b' '
+                {
+                    FORM_HOSTS_ZERO
+                } else {
+                    FORM_VERBATIM
+                };
+                let id = self.store.push(list, rule.line, except, form);
+                self.exact.insert(domain.as_bytes(), id);
+                if form == FORM_VERBATIM {
+                    self.store.push_verbatim(id, rule.text);
+                }
+            }
+            PatternRef::Wildcard {
                 expr,
                 include_subdomains,
-            } => self.wildcards.push(WildcardEntry {
-                expr: expr.as_str().into(),
-                include_subdomains: *include_subdomains,
-                rule: id,
-            }),
+            } => {
+                let id = self.store.push(list, rule.line, except, FORM_VERBATIM);
+                self.store.push_verbatim(id, rule.text);
+                let idx = u32::try_from(self.wildcards.len()).expect("too many wildcards");
+                match wildcard_anchor(expr) {
+                    Some(anchor) => self
+                        .wildcard_buckets
+                        .entry(anchor.into())
+                        .or_default()
+                        .push(idx),
+                    None => self.wildcard_unanchored.push(idx),
+                }
+                self.wildcards.push(WildcardEntry {
+                    expr: expr.as_ref().into(),
+                    include_subdomains: *include_subdomains,
+                    rule: id,
+                });
+            }
         }
-    }
-
-    /// Compact one list's rules into the engine (the rules are consumed
-    /// and their per-rule allocations freed immediately).
-    pub(crate) fn add_list(&mut self, rules: Vec<Rule>) -> usize {
-        let list = self.begin_list();
-        for rule in rules {
-            self.add_rule(&rule);
-        }
-        list
     }
 
     pub(crate) fn finish(&mut self) {
-        self.subtree.sort();
-        self.exact.sort();
-        self.store.text_arena.shrink_to_fit();
-        self.store.text_off.shrink_to_fit();
-        self.store.lines.shrink_to_fit();
-        self.store.lists.shrink_to_fit();
-        self.store.actions.shrink_to_fit();
-        self.subtree.arena.shrink_to_fit();
-        self.subtree.entries.shrink_to_fit();
-        self.exact.arena.shrink_to_fit();
-        self.exact.entries.shrink_to_fit();
+        let Self {
+            store,
+            subtree,
+            exact,
+            ..
+        } = self;
+        subtree.finish(|rule, off| {
+            if store.form(rule) == FORM_SUBTREE {
+                store.span_off[rule as usize] = off;
+            }
+        });
+        exact.finish(|rule, off| {
+            if matches!(
+                store.form(rule),
+                FORM_EXACT | FORM_EXACT_CARET | FORM_HOSTS_ZERO
+            ) {
+                store.span_off[rule as usize] = off;
+            }
+        });
+        // Canonical spans point at their key; set the key lengths now that
+        // offsets are final (keys and domains have equal length).
+        for i in 0..subtree.rules.len() {
+            let rule = subtree.rules[i];
+            if store.form(rule) == FORM_SUBTREE {
+                store.span_len[rule as usize] = subtree.lens[i];
+            }
+        }
+        for i in 0..exact.rules.len() {
+            let rule = exact.rules[i];
+            if matches!(
+                store.form(rule),
+                FORM_EXACT | FORM_EXACT_CARET | FORM_HOSTS_ZERO
+            ) {
+                store.span_len[rule as usize] = exact.lens[i];
+            }
+        }
+        store.lists.shrink_to_fit();
+        store.lines.shrink_to_fit();
+        store.flags.shrink_to_fit();
+        store.span_off.shrink_to_fit();
+        store.span_len.shrink_to_fit();
+        store.verbatim.shrink_to_fit();
+        self.wildcards.shrink_to_fit();
     }
 
     /// Number of lists compiled into this engine.
@@ -209,12 +379,30 @@ impl Engine {
         self.store.len()
     }
 
+    /// Heap bytes held by the compiled engine (for `status`).
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.store.heap_bytes()
+            + self.subtree.heap_bytes()
+            + self.exact.heap_bytes()
+            + self
+                .wildcards
+                .iter()
+                .map(|w| w.expr.len() + 24)
+                .sum::<usize>()
+            + self
+                .wildcard_buckets
+                .iter()
+                .map(|(k, v)| k.len() + v.capacity() * 4 + 48)
+                .sum::<usize>()
+    }
+
     /// Evaluate one query name (any case, optional trailing dot).
     #[must_use]
     pub fn verdict(&self, name: &str) -> Verdict<'_> {
-        // Fast path: most query names are already lowercase with no
-        // trailing dot; avoid the per-query allocation for those.
-        let lowered: std::borrow::Cow<'_, str> = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        // Most query names are already lowercase with no trailing dot;
+        // avoid the per-query allocation for those.
+        let lowered: Cow<'_, str> = if name.bytes().any(|b| b.is_ascii_uppercase()) {
             name.to_ascii_lowercase().into()
         } else {
             name.into()
@@ -235,20 +423,20 @@ impl Engine {
             }
         };
 
-        // Exact rules.
         for id in self.exact.equal_range(name.as_bytes()) {
             if consider(id) {
                 return self.except(id);
             }
         }
-        // Subtree rules: each label-boundary prefix of the reversed name
-        // is a candidate key.
-        let rev = reversed_labels(name);
+
+        let mut buf = [0u8; 256];
+        let n = reverse_labels_into(name.as_bytes(), &mut buf);
+        let rev = &buf[..n];
         let boundaries = rev
             .iter()
             .enumerate()
             .filter_map(|(i, &b)| (b == b'.').then_some(i))
-            .chain(std::iter::once(rev.len()));
+            .chain(std::iter::once(n));
         for end in boundaries {
             for id in self.subtree.equal_range(&rev[..end]) {
                 if consider(id) {
@@ -256,16 +444,37 @@ impl Engine {
                 }
             }
         }
-        // Wildcard rules.
-        for w in &self.wildcards {
-            if wildcard_matches(&w.expr, name, w.include_subdomains) && consider(w.rule) {
-                return self.except(w.rule);
+
+        if !self.wildcards.is_empty() {
+            let mut check = |idx: u32| -> Option<u32> {
+                let w = &self.wildcards[idx as usize];
+                (wildcard_matches(&w.expr, name, w.include_subdomains) && consider(w.rule))
+                    .then_some(w.rule)
+            };
+            let mut suffix = name;
+            loop {
+                if let Some(bucket) = self.wildcard_buckets.get(suffix) {
+                    for &idx in bucket {
+                        if let Some(id) = check(idx) {
+                            return self.except(id);
+                        }
+                    }
+                }
+                match suffix.find('.') {
+                    Some(dot) => suffix = &suffix[dot + 1..],
+                    None => break,
+                }
+            }
+            for &idx in &self.wildcard_unanchored {
+                if let Some(id) = check(idx) {
+                    return self.except(id);
+                }
             }
         }
 
         match block {
             Some(id) => {
-                let (list, rule) = self.store.matched(id);
+                let (list, rule) = self.matched(id);
                 Verdict::Block { list, rule }
             }
             None => Verdict::NoMatch,
@@ -273,8 +482,48 @@ impl Engine {
     }
 
     fn except(&self, id: u32) -> Verdict<'_> {
-        let (list, rule) = self.store.matched(id);
+        let (list, rule) = self.matched(id);
         Verdict::Except { list, rule }
+    }
+
+    fn matched(&self, id: u32) -> (usize, MatchedRule<'_>) {
+        let i = id as usize;
+        let s = &self.store;
+        let except = s.is_except(id);
+        let (off, len) = (s.span_off[i] as usize, usize::from(s.span_len[i]));
+        let at = if except { "@@" } else { "" };
+        let text: Cow<'_, str> = match s.form(id) {
+            FORM_SUBTREE => {
+                let key = &self.subtree.arena[off..off + len];
+                let mut buf = [0u8; 256];
+                let n = reverse_labels_into(key, &mut buf);
+                let domain = std::str::from_utf8(&buf[..n]).expect("keys are ASCII");
+                format!("{at}||{domain}^").into()
+            }
+            FORM_EXACT | FORM_EXACT_CARET | FORM_HOSTS_ZERO => {
+                let domain =
+                    std::str::from_utf8(&self.exact.arena[off..off + len]).expect("keys are ASCII");
+                match s.form(id) {
+                    FORM_EXACT if except => format!("@@{domain}").into(),
+                    FORM_EXACT => Cow::Borrowed(domain),
+                    FORM_EXACT_CARET => format!("{at}{domain}^").into(),
+                    _ => format!("0.0.0.0 {domain}").into(),
+                }
+            }
+            _ => Cow::Borrowed(&s.verbatim[off..off + len]),
+        };
+        (
+            usize::from(s.lists[i]),
+            MatchedRule {
+                action: if except {
+                    RuleAction::Except
+                } else {
+                    RuleAction::Block
+                },
+                text,
+                line: s.lines[i],
+            },
+        )
     }
 }
 

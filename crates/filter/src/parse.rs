@@ -1,5 +1,12 @@
 //! Blocklist parser: ABP-DNS subset + hosts format, mixed per line.
+//!
+//! The parser never allocates for a well-formed lowercase rule: it hands
+//! out [`RuleRef`]s that borrow the list text, and the engine copies only
+//! the bytes it keeps. A multi-million-line list is therefore parsed
+//! without one heap allocation per rule (the cost that dominated startup
+//! and the reload memory peak).
 
+use std::borrow::Cow;
 use std::net::IpAddr;
 
 use crate::{IssueReason, LineIssue, ParsedList, Pattern, Rule, RuleAction};
@@ -21,39 +28,92 @@ const LOCALHOST_NAMES: [&str; 11] = [
 
 const COSMETIC_MARKERS: [&str; 5] = ["##", "#@#", "#?#", "#$#", "#%#"];
 
-/// Line-by-line parse feeding each rule to `sink` instead of collecting
-/// them; issues accumulate in `issues`. The non-streaming [`parse_list`]
-/// is this with a Vec sink.
-pub(crate) fn parse_list_streamed(
-    text: &str,
-    sink: &mut dyn FnMut(&crate::Rule),
+/// A rule borrowed from the list text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuleRef<'a> {
+    pub action: RuleAction,
+    pub pattern: PatternRef<'a>,
+    /// The trimmed source line.
+    pub text: &'a str,
+    pub line: u32,
+}
+
+/// [`Pattern`] with a borrowed (or, for uppercase input, owned) domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PatternRef<'a> {
+    Exact(Cow<'a, str>),
+    Subtree(Cow<'a, str>),
+    Wildcard {
+        expr: Cow<'a, str>,
+        include_subdomains: bool,
+    },
+}
+
+impl<'a> RuleRef<'a> {
+    pub(crate) fn from_rule(rule: &'a Rule) -> Self {
+        Self {
+            action: rule.action,
+            pattern: match &rule.pattern {
+                Pattern::Exact(d) => PatternRef::Exact(Cow::Borrowed(d)),
+                Pattern::Subtree(d) => PatternRef::Subtree(Cow::Borrowed(d)),
+                Pattern::Wildcard {
+                    expr,
+                    include_subdomains,
+                } => PatternRef::Wildcard {
+                    expr: Cow::Borrowed(expr),
+                    include_subdomains: *include_subdomains,
+                },
+            },
+            text: &rule.text,
+            line: rule.line,
+        }
+    }
+
+    pub(crate) fn to_owned_rule(&self) -> Rule {
+        Rule {
+            action: self.action,
+            pattern: match &self.pattern {
+                PatternRef::Exact(d) => Pattern::Exact(d.to_string()),
+                PatternRef::Subtree(d) => Pattern::Subtree(d.to_string()),
+                PatternRef::Wildcard {
+                    expr,
+                    include_subdomains,
+                } => Pattern::Wildcard {
+                    expr: expr.to_string(),
+                    include_subdomains: *include_subdomains,
+                },
+            },
+            text: self.text.to_owned(),
+            line: self.line,
+        }
+    }
+}
+
+/// Feed every rule of `text` to `sink`; rejected lines go to `issues`.
+pub(crate) fn parse_list_streamed<'a>(
+    text: &'a str,
+    sink: &mut dyn FnMut(&RuleRef<'a>),
     issues: &mut Vec<LineIssue>,
 ) {
-    let mut scratch = ParsedList::default();
     for (idx, raw) in text.lines().enumerate() {
         let line_no = u32::try_from(idx).unwrap_or(u32::MAX).saturating_add(1);
         let line = raw.trim();
         if skip_or_report_comment(line, line_no, issues) {
             continue;
         }
-        parse_line(line, line_no, &mut scratch);
-        for rule in scratch.rules.drain(..) {
-            sink(&rule);
-        }
-        issues.append(&mut scratch.issues);
+        parse_line(line, line_no, sink, issues);
     }
 }
 
 pub(crate) fn parse_list(text: &str) -> ParsedList {
     let mut out = ParsedList::default();
-    for (idx, raw) in text.lines().enumerate() {
-        let line_no = u32::try_from(idx).unwrap_or(u32::MAX).saturating_add(1);
-        let line = raw.trim();
-        if skip_or_report_comment(line, line_no, &mut out.issues) {
-            continue;
-        }
-        parse_line(line, line_no, &mut out);
-    }
+    let mut rules = Vec::new();
+    parse_list_streamed(
+        text,
+        &mut |r| rules.push(r.to_owned_rule()),
+        &mut out.issues,
+    );
+    out.rules = rules;
     out
 }
 
@@ -62,6 +122,11 @@ pub(crate) fn parse_list(text: &str) -> ParsedList {
 /// comments and are reported; `## heading` and `####` banners are.
 fn skip_or_report_comment(line: &str, line_no: u32, issues: &mut Vec<LineIssue>) -> bool {
     if line.is_empty() || line.starts_with('!') {
+        return true;
+    }
+    // `[Adblock Plus]`-style headers open most ABP lists: a format
+    // marker, not a rule and not worth an issue on every load.
+    if line.starts_with('[') && line.ends_with(']') {
         return true;
     }
     if line.starts_with('#') {
@@ -85,7 +150,12 @@ fn skip_or_report_comment(line: &str, line_no: u32, issues: &mut Vec<LineIssue>)
     false
 }
 
-fn parse_line(line: &str, line_no: u32, out: &mut ParsedList) {
+fn parse_line<'a>(
+    line: &'a str,
+    line_no: u32,
+    sink: &mut dyn FnMut(&RuleRef<'a>),
+    issues: &mut Vec<LineIssue>,
+) {
     let issue = |reason| LineIssue {
         line: line_no,
         text: line.to_string(),
@@ -97,20 +167,20 @@ fn parse_line(line: &str, line_no: u32, out: &mut ParsedList) {
     if let Some(first) = line.split_whitespace().next()
         && let Ok(ip) = first.split('%').next().unwrap_or(first).parse::<IpAddr>()
     {
-        parse_hosts_line(line, ip, line_no, out);
+        parse_hosts_line(line, ip, line_no, sink, issues);
         return;
     }
 
     if COSMETIC_MARKERS.iter().any(|m| line.contains(m)) {
-        out.issues.push(issue(IssueReason::CosmeticRule));
+        issues.push(issue(IssueReason::CosmeticRule));
         return;
     }
     if line.contains('$') {
-        out.issues.push(issue(IssueReason::UnsupportedModifier));
+        issues.push(issue(IssueReason::UnsupportedModifier));
         return;
     }
     if line.len() > 1 && line.starts_with('/') && line.ends_with('/') {
-        out.issues.push(issue(IssueReason::UnsupportedSyntax));
+        issues.push(issue(IssueReason::UnsupportedSyntax));
         return;
     }
 
@@ -124,57 +194,63 @@ fn parse_line(line: &str, line_no: u32, out: &mut ParsedList) {
     };
     let rest = rest.strip_suffix('^').unwrap_or(rest);
     if rest.contains('^') || rest.starts_with('|') {
-        out.issues.push(issue(IssueReason::UnsupportedSyntax));
+        issues.push(issue(IssueReason::UnsupportedSyntax));
         return;
     }
 
     let pattern = if rest.contains('*') {
-        normalize_wildcard(rest).map(|expr| Pattern::Wildcard {
+        normalize_wildcard(rest).map(|expr| PatternRef::Wildcard {
             expr,
             include_subdomains: subtree,
         })
     } else {
         normalize_domain(rest).map(|domain| {
             if subtree {
-                Pattern::Subtree(domain)
+                PatternRef::Subtree(domain)
             } else {
-                Pattern::Exact(domain)
+                PatternRef::Exact(domain)
             }
         })
     };
     let Some(pattern) = pattern else {
-        out.issues.push(issue(IssueReason::InvalidDomain));
+        issues.push(issue(IssueReason::InvalidDomain));
         return;
     };
-    out.rules.push(Rule {
+    sink(&RuleRef {
         action,
         pattern,
-        text: line.to_string(),
+        text: line,
         line: line_no,
     });
 }
 
-fn parse_hosts_line(line: &str, ip: IpAddr, line_no: u32, out: &mut ParsedList) {
+fn parse_hosts_line<'a>(
+    line: &'a str,
+    ip: IpAddr,
+    line_no: u32,
+    sink: &mut dyn FnMut(&RuleRef<'a>),
+    issues: &mut Vec<LineIssue>,
+) {
     // Strip a trailing `# comment` (hosts syntax only).
     let effective = line.split('#').next().unwrap_or(line).trim();
     // Localhost machinery describes the local machine regardless of the IP
     // (255.255.255.255 broadcasthost, ff02::1 ip6-allnodes, ...): skip it
     // silently before deciding whether the IP is a blockable sink.
-    let names: Vec<&str> = effective
+    let is_localhost = |name: &str| {
+        let bare = name.strip_suffix('.').unwrap_or(name);
+        LOCALHOST_NAMES.iter().any(|l| l.eq_ignore_ascii_case(bare))
+    };
+    let mut names = effective
         .split_whitespace()
         .skip(1)
-        .filter(|name| {
-            let lowered = name.to_ascii_lowercase();
-            let bare = lowered.strip_suffix('.').unwrap_or(&lowered).to_string();
-            !LOCALHOST_NAMES.contains(&bare.as_str())
-        })
-        .collect();
-    if names.is_empty() {
+        .filter(|n| !is_localhost(n))
+        .peekable();
+    if names.peek().is_none() {
         return;
     }
 
     if !(ip.is_unspecified() || ip.is_loopback()) {
-        out.issues.push(LineIssue {
+        issues.push(LineIssue {
             line: line_no,
             text: line.to_string(),
             reason: IssueReason::UnsupportedHostsEntry,
@@ -183,13 +259,13 @@ fn parse_hosts_line(line: &str, ip: IpAddr, line_no: u32, out: &mut ParsedList) 
     }
     for name in names {
         match normalize_domain(name) {
-            Some(domain) => out.rules.push(Rule {
+            Some(domain) => sink(&RuleRef {
                 action: RuleAction::Block,
-                pattern: Pattern::Exact(domain),
-                text: line.to_string(),
+                pattern: PatternRef::Exact(domain),
+                text: line,
                 line: line_no,
             }),
-            None => out.issues.push(LineIssue {
+            None => issues.push(LineIssue {
                 line: line_no,
                 text: line.to_string(),
                 reason: IssueReason::InvalidDomain,
@@ -198,10 +274,19 @@ fn parse_hosts_line(line: &str, ip: IpAddr, line_no: u32, out: &mut ParsedList) 
     }
 }
 
+/// Strip one trailing dot and lowercase, borrowing when already lowercase.
+fn lower_strip(s: &str) -> Cow<'_, str> {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 /// Lowercase, strip one trailing dot, validate as a DNS name.
-pub(crate) fn normalize_domain(s: &str) -> Option<String> {
-    let s = s.to_ascii_lowercase();
-    let s = s.strip_suffix('.').unwrap_or(&s);
+pub(crate) fn normalize_domain(s: &str) -> Option<Cow<'_, str>> {
+    let s = lower_strip(s);
     if s.is_empty() || s.len() > 253 {
         return None;
     }
@@ -220,16 +305,15 @@ pub(crate) fn normalize_domain(s: &str) -> Option<String> {
             return None;
         }
     }
-    Some(s.to_string())
+    Some(s)
 }
 
 /// Like [`normalize_domain`] but the expression may contain `*`.
 ///
 /// Requires at least one alphanumeric character: a rule matching purely on
 /// stars and separators is a list bug, not a filter.
-fn normalize_wildcard(s: &str) -> Option<String> {
-    let s = s.to_ascii_lowercase();
-    let s = s.strip_suffix('.').unwrap_or(&s);
+fn normalize_wildcard(s: &str) -> Option<Cow<'_, str>> {
+    let s = lower_strip(s);
     if s.is_empty() || s.len() > 253 || !s.bytes().any(|b| b.is_ascii_alphanumeric()) {
         return None;
     }
@@ -254,5 +338,5 @@ fn normalize_wildcard(s: &str) -> Option<String> {
             return None;
         }
     }
-    Some(s.to_string())
+    Some(s)
 }

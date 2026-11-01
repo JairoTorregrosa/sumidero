@@ -15,9 +15,9 @@ fn verdict_one(list: &str, name: &str) -> VerdictOwned {
         parsed.issues
     );
     let mut builder = EngineBuilder::new();
-    builder.add_list(parsed.rules);
+    builder.add_list(&parsed.rules);
     let engine = builder.build();
-    to_owned(engine.verdict(name))
+    to_owned(&engine.verdict(name))
 }
 
 /// Build an engine from two list strings and return the verdict for `name`.
@@ -35,10 +35,10 @@ fn verdict_two(list0: &str, list1: &str, name: &str) -> VerdictOwned {
         p1.issues
     );
     let mut builder = EngineBuilder::new();
-    builder.add_list(p0.rules);
-    builder.add_list(p1.rules);
+    builder.add_list(&p0.rules);
+    builder.add_list(&p1.rules);
     let engine = builder.build();
-    to_owned(engine.verdict(name))
+    to_owned(&engine.verdict(name))
 }
 
 /// Owned snapshot of a [`Verdict`] so we can outlive the engine borrow.
@@ -49,11 +49,11 @@ enum VerdictOwned {
     Except { list: usize },
 }
 
-fn to_owned(v: Verdict<'_>) -> VerdictOwned {
+fn to_owned(v: &Verdict<'_>) -> VerdictOwned {
     match v {
         Verdict::NoMatch => VerdictOwned::NoMatch,
-        Verdict::Block { list, .. } => VerdictOwned::Block { list },
-        Verdict::Except { list, .. } => VerdictOwned::Except { list },
+        Verdict::Block { list, .. } => VerdictOwned::Block { list: *list },
+        Verdict::Except { list, .. } => VerdictOwned::Except { list: *list },
     }
 }
 

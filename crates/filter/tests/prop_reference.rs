@@ -105,7 +105,7 @@ fn query() -> impl Strategy<Value = String> {
 
 /// One rule line in the v1 subset, built from a random domain.
 fn rule_line() -> impl Strategy<Value = String> {
-    let form = (domain(), 0u8..9).prop_map(|(d, kind)| match kind {
+    let form = (domain(), 0u8..11).prop_map(|(d, kind)| match kind {
         0 => format!("||{d}^"),
         1 => d,
         2 => format!("*.{d}"),
@@ -114,6 +114,9 @@ fn rule_line() -> impl Strategy<Value = String> {
         5 => format!("{d}^"),
         6 => format!("||*.{d}^"),
         7 => format!("{d}.*"),
+        // Star inside a label, anchored on the labels after it.
+        8 => format!("a*.{d}"),
+        9 => format!("||*d*.{d}^"),
         _ => format!("0.0.0.0 {d}"),
     });
     (proptest::bool::ANY, form).prop_map(|(except, line)| {
@@ -138,7 +141,7 @@ proptest! {
         prop_assert!(parsed.issues.is_empty(), "generator produced invalid rules: {:?}", parsed.issues);
         let rules = parsed.rules.clone();
         let mut builder = EngineBuilder::new();
-        builder.add_list(parsed.rules);
+        builder.add_list(&parsed.rules);
         let engine = builder.build();
         for q in &queries {
             prop_assert_eq!(
@@ -146,6 +149,23 @@ proptest! {
                 naive_verdict(&rules, q),
                 "divergence on query {:?} against rules {:?}", q, lines
             );
+        }
+
+        // The streamed loader (production path) agrees, and the rule text
+        // it reports is always one of the list's real lines, including the
+        // canonical forms the engine rebuilds instead of storing.
+        let mut streamed = EngineBuilder::new();
+        streamed.add_list_text(&lines.join("\n"));
+        let streamed = streamed.build();
+        for q in &queries {
+            let v = streamed.verdict(q);
+            prop_assert_eq!(kind(&v), naive_verdict(&rules, q));
+            if let Verdict::Block { rule, .. } | Verdict::Except { rule, .. } = &v {
+                prop_assert!(
+                    lines.iter().any(|l| l == &*rule.text),
+                    "reported text {:?} is not a list line {:?}", rule.text, lines
+                );
+            }
         }
     }
 
@@ -158,7 +178,7 @@ proptest! {
     fn verdict_never_panics(name in "\\PC*") {
         let parsed = parse_list("||example.com^\n@@safe.example.com\n*.ads.net");
         let mut builder = EngineBuilder::new();
-        builder.add_list(parsed.rules);
+        builder.add_list(&parsed.rules);
         let engine = builder.build();
         let _ = engine.verdict(&name);
     }

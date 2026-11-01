@@ -92,13 +92,12 @@ fn multiple_comments_mixed() {
 // ===========================================================================
 
 #[test]
-fn adblock_header_produces_issue() {
-    // Starts with `[`, which is not a valid domain character. The contract
-    // rejects "everything else" loudly. Since it does not match any specific
-    // syntax bucket (cosmetic, modifier, regex, single-pipe) it falls through
-    // to InvalidDomain — the domain part is simply not a valid DNS name.
-    let pl = parse_one("[Adblock Plus 2.0]");
-    assert_single_issue(&pl, IssueReason::InvalidDomain, 1, "[Adblock Plus 2.0]");
+fn adblock_header_is_a_format_marker_not_an_issue() {
+    // Every ABP list in production opens with this line; reporting it
+    // put one warning per list into every load.
+    let pl = parse_list("[Adblock Plus]\n||ads.example.com^\n");
+    assert!(pl.issues.is_empty(), "{:?}", pl.issues);
+    assert_eq!(pl.rules.len(), 1);
 }
 
 // ===========================================================================
@@ -297,7 +296,7 @@ example.com##.banner\n";
     assert_eq!(pl.issues.len(), 1);
 
     let mut builder = EngineBuilder::new();
-    let _idx = builder.add_list(pl.rules);
+    let _idx = builder.add_list(&pl.rules);
     let _engine = builder.build();
     // Engine builds without panic — the cosmetic issue is separate.
 }

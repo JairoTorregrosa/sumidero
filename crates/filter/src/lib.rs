@@ -148,6 +148,27 @@ pub struct ParsedList {
     pub issues: Vec<LineIssue>,
 }
 
+/// Rule and issue counts for a list, without building anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListCounts {
+    pub rules: usize,
+    pub issues: usize,
+}
+
+/// Count the rules a list would contribute, without allocating per rule
+/// (validates a freshly downloaded list before it replaces the stored
+/// copy).
+#[must_use]
+pub fn count_rules(text: &str) -> ListCounts {
+    let mut rules = 0usize;
+    let mut issues = Vec::new();
+    parse::parse_list_streamed(text, &mut |_| rules += 1, &mut issues);
+    ListCounts {
+        rules,
+        issues: issues.len(),
+    }
+}
+
 /// Parse a whole blocklist (ABP-DNS subset and/or hosts format, mixed).
 ///
 /// Never fails: unparseable lines land in [`ParsedList::issues`].
@@ -160,17 +181,19 @@ pub fn parse_list(text: &str) -> ParsedList {
 /// engine's shared storage (the engine does not keep full [`Rule`]
 /// structs — at millions of rules the per-rule allocations dominated
 /// memory on small hosts).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedRule<'a> {
     pub action: RuleAction,
-    /// Original rule text, trimmed — for `explain` output.
-    pub text: &'a str,
+    /// Original rule text, trimmed — for `explain` output. Canonical
+    /// forms (`||d^`, `d`, `0.0.0.0 d`) are rebuilt from the key, so
+    /// this may be owned.
+    pub text: std::borrow::Cow<'a, str>,
     /// 1-based line number in the source list.
     pub line: u32,
 }
 
 /// The verdict for one query name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict<'a> {
     /// No rule matched.
     NoMatch,
@@ -243,8 +266,12 @@ impl EngineBuilder {
     }
 
     /// Add one list's rules; returns the list index used in [`Verdict`].
-    pub fn add_list(&mut self, rules: Vec<Rule>) -> usize {
-        self.engine.add_list(rules)
+    pub fn add_list(&mut self, rules: &[Rule]) -> usize {
+        let index = self.engine.begin_list();
+        for rule in rules {
+            self.engine.add_rule(&parse::RuleRef::from_rule(rule));
+        }
+        index
     }
 
     /// Parse a whole list directly into compact storage, line by line,

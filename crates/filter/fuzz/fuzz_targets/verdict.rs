@@ -14,7 +14,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let parsed = parse_list(rules);
     let mut builder = EngineBuilder::new();
-    builder.add_list(parsed.rules);
+    builder.add_list(&parsed.rules);
     let engine = builder.build();
     let _ = engine.verdict(query);
 });

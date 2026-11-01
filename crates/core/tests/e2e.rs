@@ -63,7 +63,7 @@ async fn start_on(binds: &[std::net::SocketAddr]) -> Env {
     let parsed = parse_list("||blocked.test^");
     assert_eq!(parsed.issues, [] as [sumidero_filter::LineIssue; 0]);
     let mut builder = EngineBuilder::new();
-    builder.add_list(parsed.rules);
+    builder.add_list(&parsed.rules);
     let pipeline = Pipeline::new(
         builder.build(),
         vec!["e2e".to_string()],
@@ -92,7 +92,7 @@ async fn start() -> Env {
     let parsed = parse_list("||blocked.test^");
     assert_eq!(parsed.issues, [] as [sumidero_filter::LineIssue; 0]);
     let mut builder = EngineBuilder::new();
-    builder.add_list(parsed.rules);
+    builder.add_list(&parsed.rules);
     let pipeline = Pipeline::new(
         builder.build(),
         vec!["e2e".to_string()],
@@ -215,7 +215,7 @@ async fn udp_oversized_answer_gets_truncated() {
     let tmp = tempfile::tempdir().unwrap();
     let db = Db::open(&tmp.path().join("tc.sqlite")).unwrap();
     let mut builder = EngineBuilder::new();
-    builder.add_list(parse_list("||blocked.test^").rules);
+    builder.add_list(&parse_list("||blocked.test^").rules);
     let pipeline = Pipeline::new(
         builder.build(),
         vec!["e2e".into()],

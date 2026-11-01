@@ -137,7 +137,7 @@ fn fixture_with(rules: &str, upstream: MockUpstream) -> Fixture {
     let parsed = parse_list(rules);
     assert!(parsed.issues.is_empty(), "{:?}", parsed.issues);
     let mut builder = EngineBuilder::new();
-    builder.add_list(parsed.rules);
+    builder.add_list(&parsed.rules);
     let calls = Arc::clone(&upstream.calls);
     let pipeline = Pipeline::new(
         builder.build(),
@@ -412,7 +412,7 @@ async fn swap_engine_changes_verdicts_without_restart() {
     assert_eq!(r1.metadata.response_code, ResponseCode::NoError);
     let parsed = parse_list("||newly-blocked.test^");
     let mut b = EngineBuilder::new();
-    b.add_list(parsed.rules);
+    b.add_list(&parsed.rules);
     f.pipeline.swap_engine(b.build(), vec!["v2".to_string()]);
     let r2 = f.pipeline.handle_at(&q, CLIENT, Instant::now()).await;
     assert_eq!(r2.metadata.response_code, ResponseCode::NXDomain);
@@ -498,7 +498,7 @@ async fn safesearch_youtube_and_aaaa() {
     let db = Db::open(&tmp.path().join("t.sqlite")).unwrap();
     let parsed = parse_list("||blocked.test^");
     let mut builder = EngineBuilder::new();
-    builder.add_list(parsed.rules);
+    builder.add_list(&parsed.rules);
     let pipeline = Pipeline::new(
         builder.build(),
         vec!["l".into()],
@@ -710,7 +710,7 @@ async fn shadow_records_expected_and_real_divergences() {
     let db = Db::open(&tmp.path().join("shadow.sqlite")).unwrap();
     let parsed = parse_list("||blocked.test^");
     let mut builder = EngineBuilder::new();
-    builder.add_list(parsed.rules);
+    builder.add_list(&parsed.rules);
     // Reference blocks blocked.test (0.0.0.0 style) AND extra.test, which
     // we do not block.
     let reference = spawn_fake_adguard(&["blocked.test", "extra.test"]).await;
