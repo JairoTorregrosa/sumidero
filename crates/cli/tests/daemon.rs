@@ -203,6 +203,8 @@ async fn daemon_starts_reloads_refuses_bad_reloads_and_reports_each_step() {
     assert_eq!(code, Some(0), "{status}");
     assert_eq!(status["lists"][0]["origin"], "downloaded", "{status}");
     assert_eq!(status["lists"][1]["origin"], "local_file");
+    // Published with the first answerable moment, not a minute later.
+    assert_eq!(status["upstreams"][0]["state"], "connected", "{status}");
 
     // The list changes upstream; reload picks it up and says so.
     w.host.put("remote.txt", "||blocked.test^\n||newly.test^\n");

@@ -405,7 +405,16 @@ pub async fn run(
     }
     let pipeline = Arc::new(pipeline);
     write_heartbeat(&db, started_ts, &snapshot(&shared))?;
-    publish_runtime(&db, &shared).await;
+    // Counters too, not only the lifecycle report: until the first timed
+    // heartbeat, `status` would otherwise show no upstreams on a new
+    // database, or the previous process's upstream counters on an old one.
+    let mut dropped_at_last_sample: u64 = 0;
+    publish_stats(
+        &db,
+        &pipeline,
+        &snapshot(&shared),
+        &mut dropped_at_last_sample,
+    );
 
     let server = serve(Arc::clone(&pipeline), &config.server.bind).await?;
     tracing::info!(udp = ?server.udp_addrs, tcp = ?server.tcp_addrs, "serving");
@@ -429,9 +438,6 @@ pub async fn run(
     let mut retention = tokio::time::interval(Duration::from_hours(1));
     heartbeat.tick().await;
     retention.tick().await;
-    // Drop count at the previous heartbeat, so each sample reports what
-    // was lost since then rather than since start.
-    let mut dropped_at_last_sample: u64 = 0;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
