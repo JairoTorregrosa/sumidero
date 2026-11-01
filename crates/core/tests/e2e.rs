@@ -237,8 +237,12 @@ async fn tcp_from_a_stranger_is_closed_without_an_answer() {
         SafeSearch::new::<&str>(false, &[]).unwrap(),
         vec!["::1/128".parse::<IpNet>().unwrap()],
     );
-    let server = serve(Arc::new(p), &["127.0.0.1:0".parse().unwrap()]).await.unwrap();
-    let mut s = tokio::net::TcpStream::connect(server.tcp_addrs[0]).await.unwrap();
+    let server = serve(Arc::new(p), &["127.0.0.1:0".parse().unwrap()])
+        .await
+        .unwrap();
+    let mut s = tokio::net::TcpStream::connect(server.tcp_addrs[0])
+        .await
+        .unwrap();
     assert!(closed_by_server(&mut s).await);
     server.shutdown().await;
 }
@@ -254,11 +258,18 @@ async fn tcp_connections_beyond_the_cap_are_closed() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
-    assert!(closed_by_server(&mut extra).await, "connection {} must be refused", MAX_TCP_CONNECTIONS + 1);
+    assert!(
+        closed_by_server(&mut extra).await,
+        "connection {} must be refused",
+        MAX_TCP_CONNECTIONS + 1
+    );
     // Freeing one slot lets the next client in.
     drop(held.pop());
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(query_tcp(addr, "blocked.test", RecordType::A).await.rcode, ResponseCode::NXDomain);
+    assert_eq!(
+        query_tcp(addr, "blocked.test", RecordType::A).await.rcode,
+        ResponseCode::NXDomain
+    );
     env.server.shutdown().await;
 }
 
@@ -281,13 +292,20 @@ async fn udp_answers_never_exceed_1232_bytes_even_if_the_client_offers_more() {
     let mut edns = hickory_proto::op::Edns::new();
     edns.set_max_payload(4096);
     msg.set_edns(edns);
-    sock.send_to(&msg.to_vec().unwrap(), env.server.udp_addrs[0]).await.unwrap();
+    sock.send_to(&msg.to_vec().unwrap(), env.server.udp_addrs[0])
+        .await
+        .unwrap();
     let mut buf = [0u8; 8192];
     let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
         .await
         .unwrap()
         .unwrap();
     assert!(n <= 1232, "UDP answer of {n} bytes");
-    assert!(hickory_proto::op::Message::from_vec(&buf[..n]).unwrap().metadata.truncation);
+    assert!(
+        hickory_proto::op::Message::from_vec(&buf[..n])
+            .unwrap()
+            .metadata
+            .truncation
+    );
     env.server.shutdown().await;
 }
