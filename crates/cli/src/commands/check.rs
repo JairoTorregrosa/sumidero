@@ -18,12 +18,12 @@ pub(crate) fn validate(config: &Path) -> Result<CheckReport, String> {
         .block_on(sumidero_core::lists::load(
             &cfg.effective_lists(),
             &cfg.filtering.list_dir,
-            true,
+            None,
         ))
         .map_err(|e| e.to_string())?;
     Ok(CheckReport {
         lists: loaded.names,
-        rule_counts: loaded.rule_counts,
+        rule_counts: loaded.reports.iter().map(|r| r.rules).collect(),
         issues: loaded.issues.len(),
         lists_hash: loaded.hash,
         config_hash: cfg.hash(),

@@ -1,24 +1,50 @@
 //! Blocklist acquisition and engine building. Fail loud.
 //!
 //! For each [`crate::config::ListSource`] (in `effective_lists` order):
-//! - `path` set: read the file; unreadable = error.
-//! - `url` set: fetch with `If-None-Match` against the stored `ETag`.
-//!   Success stores body + `ETag` under `list_dir/<name>.txt` / `.etag`.
-//!   Fetch failure falls back to the stored copy WITH a loud warning;
-//!   fetch failure with no stored copy is a hard [`ListError`] — the
-//!   daemon must not start half-filtering (settled design).
-//! - Both set: `path` seeds the first run, `url` refreshes thereafter.
+//! - `path` only: read the file; unreadable = error.
+//! - `url` set, online ([`Fetcher`] given): `GET` with `If-None-Match`
+//!   against the stored `ETag`. A 200 whose body holds at least one rule
+//!   replaces `list_dir/<name>.txt` atomically (temp file + rename); a
+//!   304 marks the stored copy as verified now (its mtime). Any failure
+//!   falls back to the stored copy, then to `path` as a seed, and says
+//!   so in the list's [`ListOrigin`]; with neither it is a hard
+//!   [`ListError`]: the daemon never starts half-filtering.
+//! - `url` set, offline (no fetcher; `check`, `explain`): stored copy,
+//!   then `path` seed.
 //!
-//! Parse issues from each list are reported (logged + returned), never
-//! swallowed. The combined hash is SHA-256 over each list's raw bytes in
-//! order — the daemon heartbeat and `explain` compare it.
+//! List hosts are resolved through the daemon's own encrypted upstreams
+//! ([`Fetcher::new`]), never through the host resolver: a filtering host
+//! resolver (Cloudflare Families answers `0.0.0.0` for `nsfw.oisd.nl`)
+//! must not be able to starve the filter of the very list that blocks
+//! what it blocks.
+//!
+//! The combined hash is SHA-256 over each list's raw bytes in order;
+//! the daemon heartbeat and `explain` compare it.
 
-use std::path::Path;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{Name, RData, RecordType};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sumidero_filter::LineIssue;
+use sumidero_filter::{IssueReason, LineIssue};
 
 use crate::config::ListSource;
+use crate::upstream::UpstreamPool;
+
+/// Largest list body accepted. The biggest list in use (`OISD` big) is
+/// ~10 MB; this cap keeps a broken or hostile host from exhausting the
+/// daemon's memory budget.
+pub const MAX_LIST_BYTES: usize = 64 * 1024 * 1024;
+/// TCP + TLS connect budget for one list host.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest silence between two reads of a list body.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Whole-request budget for one list.
+const REQUEST_TIMEOUT: Duration = Duration::from_mins(3);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ListError {
@@ -31,18 +57,79 @@ pub enum ListError {
     #[error("list {name}: cannot read {path}: {source}")]
     Read {
         name: String,
-        path: std::path::PathBuf,
+        path: PathBuf,
         source: std::io::Error,
     },
     #[error("list {name}: has neither url nor path")]
     NoSource { name: String },
     #[error("list_dir {0} does not exist or is not writable")]
-    ListDir(std::path::PathBuf),
+    ListDir(PathBuf),
     #[error("list_dir {path} could not be created: {source}")]
     ListDirCreate {
-        path: std::path::PathBuf,
+        path: PathBuf,
         source: std::io::Error,
     },
+    #[error("cannot build the list HTTP client: {0}")]
+    Client(String),
+}
+
+/// Where a list's rules came from on this load. `as_str` values are
+/// stable reason codes (logs, `status`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "origin", rename_all = "snake_case")]
+pub enum ListOrigin {
+    /// 200: a new body was stored.
+    Downloaded,
+    /// 304: the stored copy is confirmed current.
+    NotModified,
+    /// The fetch failed; the last stored copy is in use.
+    StoredAfterFetchFailure { reason: String },
+    /// The fetch failed and there is no stored copy; the `path` seed is
+    /// in use.
+    SeedAfterFetchFailure { reason: String },
+    /// A `path`-only list.
+    LocalFile,
+    /// Offline load (`check`, `explain`): stored copy.
+    StoredOffline,
+    /// Offline load, no stored copy: `path` seed.
+    SeedOffline,
+}
+
+impl ListOrigin {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Downloaded => "downloaded",
+            Self::NotModified => "not_modified",
+            Self::StoredAfterFetchFailure { .. } => "stored_after_fetch_failure",
+            Self::SeedAfterFetchFailure { .. } => "seed_after_fetch_failure",
+            Self::LocalFile => "local_file",
+            Self::StoredOffline => "stored_offline",
+            Self::SeedOffline => "seed_offline",
+        }
+    }
+
+    /// True when a fetch was attempted and failed.
+    #[must_use]
+    pub fn fetch_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::StoredAfterFetchFailure { .. } | Self::SeedAfterFetchFailure { .. }
+        )
+    }
+}
+
+/// What one load did with one list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListReport {
+    pub name: String,
+    #[serde(flatten)]
+    pub origin: ListOrigin,
+    pub rules: usize,
+    pub issues: usize,
+    /// Seconds since the content in use was last confirmed against its
+    /// URL (download or 304). `None` for local files.
+    pub verified_age_secs: Option<u64>,
 }
 
 /// A built engine plus provenance.
@@ -55,38 +142,132 @@ pub struct LoadedLists {
     pub hash: String,
     /// Parse issues per list name.
     pub issues: Vec<(String, LineIssue)>,
-    /// Per-list rule counts, same order as `names`.
-    pub rule_counts: Vec<usize>,
+    /// One report per list, same order as `names`.
+    pub reports: Vec<ListReport>,
 }
 
-/// Load all lists and compile the engine. `offline` skips fetching and
-/// uses stored copies only (used by `check` and tests).
+impl LoadedLists {
+    #[must_use]
+    pub fn total_rules(&self) -> usize {
+        self.reports.iter().map(|r| r.rules).sum()
+    }
+}
+
+/// HTTPS client for list downloads: public web PKI plus
+/// `[tls] extra_roots`, list hosts resolved through the upstream pool,
+/// bounded connect/read/total time and body size.
+#[derive(Debug, Clone)]
+pub struct Fetcher {
+    client: reqwest::Client,
+}
+
+impl Fetcher {
+    /// # Errors
+    ///
+    /// [`ListError::Client`] if a root certificate is unusable or the
+    /// TLS backend cannot initialise.
+    pub fn new(
+        extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+        upstreams: Arc<UpstreamPool>,
+    ) -> Result<Self, ListError> {
+        let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .https_only(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(concat!("sumidero/", env!("CARGO_PKG_VERSION")))
+            .dns_resolver(Arc::new(UpstreamResolver(upstreams)));
+        for cert in extra_roots {
+            let cert = reqwest::Certificate::from_der(cert.as_ref())
+                .map_err(|e| ListError::Client(format!("tls.extra_roots: {e}")))?;
+            builder = builder.add_root_certificate(cert);
+        }
+        builder
+            .build()
+            .map(|client| Self { client })
+            .map_err(|e| ListError::Client(e.to_string()))
+    }
+}
+
+/// Resolves list hosts with A + AAAA queries through the upstream pool.
+struct UpstreamResolver(Arc<UpstreamPool>);
+
+impl reqwest::dns::Resolve for UpstreamResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let pool = Arc::clone(&self.0);
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let (v4, v6) = tokio::join!(
+                lookup(&pool, &host, RecordType::A),
+                lookup(&pool, &host, RecordType::AAAA)
+            );
+            let mut addrs: Vec<SocketAddr> = Vec::new();
+            let mut errors = Vec::new();
+            for result in [v4, v6] {
+                match result {
+                    Ok(ips) => addrs.extend(ips.into_iter().map(|ip| SocketAddr::new(ip, 0))),
+                    Err(e) => errors.push(e),
+                }
+            }
+            if addrs.is_empty() {
+                let why = if errors.is_empty() {
+                    "no A/AAAA records".to_owned()
+                } else {
+                    errors.join("; ")
+                };
+                return Err(format!("{host}: not resolvable through the upstreams: {why}").into());
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+async fn lookup(pool: &UpstreamPool, host: &str, qtype: RecordType) -> Result<Vec<IpAddr>, String> {
+    let name = Name::from_ascii(format!("{}.", host.trim_end_matches('.')))
+        .map_err(|e| format!("{host}: {e}"))?;
+    let mut query = Message::new(0, MessageType::Query, OpCode::Query);
+    query.add_query(Query::query(name, qtype));
+    query.metadata.recursion_desired = true;
+    let answer = pool.resolve(&query).await.map_err(|e| e.to_string())?;
+    if answer.metadata.response_code != ResponseCode::NoError {
+        return Err(format!("{qtype} {}", answer.metadata.response_code));
+    }
+    Ok(answer
+        .answers
+        .iter()
+        .filter_map(|r| match &r.data {
+            RData::A(a) => Some(IpAddr::V4(a.0)),
+            RData::AAAA(a) => Some(IpAddr::V6(a.0)),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Load all lists and compile the engine. `fetcher: None` is an offline
+/// load: stored copies and seeds only, nothing is created or written.
 ///
 /// # Errors
 ///
-/// Returns `ListError::ListDir` if `list_dir` does not exist,
+/// `ListError::ListDir`/`ListDirCreate` for an unusable `list_dir`,
 /// `ListError::NoSource` if a list has neither url nor path,
-/// `ListError::Unavailable` if a list cannot be fetched and has no
-/// stored copy, or `ListError::Read` if a path-only list is unreadable.
+/// `ListError::Unavailable` if a list has no usable content at all, or
+/// `ListError::Read` if a file cannot be read.
 ///
 /// # Panics
 ///
-/// Panics if the `reqwest` client builder fails with default settings,
-/// which should not happen under normal operation.
+/// If a blocking compile task panics (a bug, propagated).
 pub async fn load(
     sources: &[ListSource],
     list_dir: &Path,
-    offline: bool,
+    fetcher: Option<&Fetcher>,
 ) -> Result<LoadedLists, ListError> {
-    // Validate list_dir exists and (when online) is writable.
-    //
-    // The daemon owns this directory — under the shipped systemd unit it
-    // lives inside `StateDirectory`, which exists on first start but is
-    // empty. Creating it is part of starting up, not a silent fallback:
-    // if creation fails the OS error is propagated and startup aborts.
-    // `offline` (`check`) never creates anything, so a misconfigured
-    // path is still reported rather than materialised.
-    if !offline && !list_dir.is_dir() {
+    // The daemon owns this directory (under systemd it lives inside
+    // `StateDirectory`, empty on first start): creating it is part of
+    // starting up, and failure aborts. Offline loads never create it,
+    // so a misconfigured path is reported rather than materialised.
+    if fetcher.is_some() && !list_dir.is_dir() {
         std::fs::create_dir_all(list_dir).map_err(|source| ListError::ListDirCreate {
             path: list_dir.to_path_buf(),
             source,
@@ -95,7 +276,7 @@ pub async fn load(
     if !list_dir.is_dir() {
         return Err(ListError::ListDir(list_dir.to_path_buf()));
     }
-    if !offline {
+    if fetcher.is_some() {
         let probe = list_dir.join(".sumidero-probe");
         if std::fs::write(&probe, b"").is_err() {
             return Err(ListError::ListDir(list_dir.to_path_buf()));
@@ -103,59 +284,44 @@ pub async fn load(
         let _ = std::fs::remove_file(&probe);
     }
 
-    let client = if offline {
-        None
-    } else {
-        Some(
-            reqwest::Client::builder()
-                .build()
-                .expect("reqwest client builder should not fail with default settings"),
-        )
-    };
-
-    // Memory-critical host: process ONE list at a time — fetch its raw
-    // text, then parse and compact it into the builder off the async
-    // runtime (>100ms of pure CPU per big list must not stall DNS
-    // serving), dropping the raw body and the parsed Vec<Rule> before
-    // the next list is fetched. Peak transient stays near one list's
-    // parse instead of the whole set's.
+    // Memory-critical host: one list at a time. Fetch its text, compile
+    // it into the builder off the async runtime (hundreds of ms of CPU
+    // for a big list must not stall DNS serving), drop the text before
+    // the next list. Peak transient stays near one list's size.
     let mut builder = sumidero_filter::EngineBuilder::new();
     let mut names = Vec::with_capacity(sources.len());
     let mut all_issues: Vec<(String, LineIssue)> = Vec::new();
-    let mut rule_counts = Vec::with_capacity(sources.len());
+    let mut reports = Vec::with_capacity(sources.len());
     let mut hasher = Sha256::new();
 
     for source in sources {
-        let raw = acquire_list(source, list_dir, offline, client.as_ref()).await?;
+        let acquired = acquire_list(source, list_dir, fetcher).await?;
         let name = source.name.clone();
+        let raw = acquired.text;
         let (b, issues, count, h) = tokio::task::spawn_blocking(move || {
             let mut hasher = hasher;
             hasher.update(raw.as_bytes());
-            // Stream the list straight into compact storage: no Vec<Rule>
-            // for a multi-million-line list (memory-critical host).
             let mut builder = builder;
             let added = builder.add_list_text(&raw);
             drop(raw);
-            let mut issues = Vec::new();
-            for issue in added.issues {
-                tracing::warn!(
-                    list = %name,
-                    line = issue.line,
-                    text = %issue.text,
-                    reason = %issue.reason,
-                    "parse issue in list"
-                );
-                issues.push((name.clone(), issue));
-            }
-            (builder, issues, added.rules, hasher)
+            (builder, added.issues, added.rules, hasher)
         })
         .await
         .expect("list compile task panicked");
         builder = b;
         hasher = h;
-        all_issues.extend(issues);
-        rule_counts.push(count);
-        names.push(source.name.clone());
+        log_issue_summary(&name, &issues);
+        let report = ListReport {
+            name: name.clone(),
+            origin: acquired.origin,
+            rules: count,
+            issues: issues.len(),
+            verified_age_secs: acquired.verified_age_secs,
+        };
+        log_report(&report);
+        all_issues.extend(issues.into_iter().map(|i| (name.clone(), i)));
+        reports.push(report);
+        names.push(name);
     }
 
     Ok(LoadedLists {
@@ -165,184 +331,289 @@ pub async fn load(
         names,
         hash: hex_encode(&hasher.finalize()),
         issues: all_issues,
-        rule_counts,
+        reports,
     })
+}
+
+/// One log line per list with rejected lines: counts per reason plus
+/// three examples, instead of one line per rejected rule.
+fn log_issue_summary(list: &str, issues: &[LineIssue]) {
+    if issues.is_empty() {
+        return;
+    }
+    let mut counts: Vec<(IssueReason, usize)> = Vec::new();
+    for issue in issues {
+        match counts.iter_mut().find(|(r, _)| *r == issue.reason) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((issue.reason, 1)),
+        }
+    }
+    let by_reason = counts
+        .iter()
+        .map(|(r, n)| format!("{r}={n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let examples = issues
+        .iter()
+        .take(3)
+        .map(|i| format!("line {}: {}", i.line, i.text))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    tracing::warn!(
+        list,
+        rejected = issues.len(),
+        by_reason,
+        examples,
+        next = "unsupported syntax is skipped; nothing to do unless a rule you rely on is listed",
+        "blocklist lines rejected"
+    );
+}
+
+fn log_report(r: &ListReport) {
+    let age_h = r.verified_age_secs.map(|s| s / 3600);
+    match &r.origin {
+        ListOrigin::StoredAfterFetchFailure { reason }
+        | ListOrigin::SeedAfterFetchFailure { reason } => {
+            tracing::warn!(
+                list = %r.name,
+                origin = r.origin.as_str(),
+                reason,
+                verified_age_h = age_h,
+                rules = r.rules,
+                next = "check the list URL and that the upstreams resolve its host",
+                "list fetch failed; serving the last good copy"
+            );
+        }
+        _ => tracing::info!(
+            list = %r.name,
+            origin = r.origin.as_str(),
+            verified_age_h = age_h,
+            rules = r.rules,
+            "list loaded"
+        ),
+    }
+}
+
+struct Acquired {
+    text: String,
+    origin: ListOrigin,
+    verified_age_secs: Option<u64>,
+}
+
+fn read(name: &str, path: &Path) -> Result<String, ListError> {
+    std::fs::read_to_string(path).map_err(|source| ListError::Read {
+        name: name.to_owned(),
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Seconds since `path` was last modified (= last verified).
+fn age_of(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(
+        SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default()
+            .as_secs(),
+    )
 }
 
 /// Acquire the raw text for one list source.
 async fn acquire_list(
     source: &ListSource,
     list_dir: &Path,
-    offline: bool,
-    client: Option<&reqwest::Client>,
-) -> Result<String, ListError> {
-    if source.url.is_none() && source.path.is_none() {
-        return Err(ListError::NoSource {
-            name: source.name.clone(),
+    fetcher: Option<&Fetcher>,
+) -> Result<Acquired, ListError> {
+    let name = source.name.as_str();
+    let Some(url) = source.url.as_deref() else {
+        let Some(path) = &source.path else {
+            return Err(ListError::NoSource {
+                name: name.to_owned(),
+            });
+        };
+        return Ok(Acquired {
+            text: read(name, path)?,
+            origin: ListOrigin::LocalFile,
+            verified_age_secs: None,
         });
-    }
+    };
 
-    let stored_path = list_dir.join(format!("{}.txt", source.name));
-    let etag_path = list_dir.join(format!("{}.etag", source.name));
+    let stored_path = list_dir.join(format!("{name}.txt"));
+    let etag_path = list_dir.join(format!("{name}.etag"));
+    let seed = source.path.as_ref().filter(|p| p.is_file());
 
-    // Path-only list (no url): read the file directly each time
-    if source.url.is_none()
-        && let Some(path) = &source.path
-    {
-        return std::fs::read_to_string(path).map_err(|e| ListError::Read {
-            name: source.name.clone(),
-            path: path.clone(),
-            source: e,
-        });
-    }
-
-    // Has a URL
-    if offline {
-        // offline mode: use stored copy, then path fallback
+    let Some(fetcher) = fetcher else {
         if stored_path.is_file() {
-            return std::fs::read_to_string(&stored_path).map_err(|e| ListError::Read {
-                name: source.name.clone(),
-                path: stored_path,
-                source: e,
+            return Ok(Acquired {
+                text: read(name, &stored_path)?,
+                origin: ListOrigin::StoredOffline,
+                verified_age_secs: age_of(&stored_path),
             });
         }
-        if let Some(path) = &source.path
-            && path.is_file()
-        {
-            return std::fs::read_to_string(path).map_err(|e| ListError::Read {
-                name: source.name.clone(),
-                path: path.clone(),
-                source: e,
+        if let Some(seed) = seed {
+            return Ok(Acquired {
+                text: read(name, seed)?,
+                origin: ListOrigin::SeedOffline,
+                verified_age_secs: None,
             });
         }
         return Err(ListError::Unavailable {
-            name: source.name.clone(),
-            url: source.url.clone().unwrap_or_default(),
-            reason: "offline".into(),
+            name: name.to_owned(),
+            url: url.to_owned(),
+            reason: "offline load and no stored copy".into(),
         });
-    }
+    };
 
-    // Online mode: fetch with ETag
-    let url = source.url.as_deref().expect("url is Some here");
-    let client = client.expect("client is Some when not offline");
-
-    let fetch_result = fetch_with_etag(client, url, &stored_path, &etag_path).await;
-
-    match fetch_result {
-        Ok(text) => Ok(text),
+    match fetch_with_etag(&fetcher.client, url, &stored_path, &etag_path).await {
+        Ok(acquired) => Ok(acquired),
         Err(reason) => {
-            // Fetch failed; try stored copy
             if stored_path.is_file() {
-                tracing::warn!(
-                    list = %source.name,
-                    url = %url,
-                    reason = %reason,
-                    "fetch failed, using stored copy"
-                );
-                return std::fs::read_to_string(&stored_path).map_err(|e| ListError::Read {
-                    name: source.name.clone(),
-                    path: stored_path,
-                    source: e,
+                return Ok(Acquired {
+                    text: read(name, &stored_path)?,
+                    verified_age_secs: age_of(&stored_path),
+                    origin: ListOrigin::StoredAfterFetchFailure { reason },
                 });
             }
-            // No stored copy; try path seed
-            if let Some(path) = &source.path
-                && path.is_file()
-            {
-                tracing::warn!(
-                    list = %source.name,
-                    url = %url,
-                    reason = %reason,
-                    "fetch failed, using path seed"
-                );
-                return std::fs::read_to_string(path).map_err(|e| ListError::Read {
-                    name: source.name.clone(),
-                    path: path.clone(),
-                    source: e,
+            if let Some(seed) = seed {
+                return Ok(Acquired {
+                    text: read(name, seed)?,
+                    verified_age_secs: None,
+                    origin: ListOrigin::SeedAfterFetchFailure { reason },
                 });
             }
             Err(ListError::Unavailable {
-                name: source.name.clone(),
-                url: url.to_string(),
+                name: name.to_owned(),
+                url: url.to_owned(),
                 reason,
             })
         }
     }
 }
 
-/// Fetch a URL with `If-None-Match` `ETag` support.
-/// Returns `Ok(text)` on success or 304-with-stored-copy.
-/// Returns `Err(reason)` on any failure.
+/// `GET` with `If-None-Match`. `Err(reason)` on any failure; the stored
+/// copy is only ever replaced by a body that holds rules.
 async fn fetch_with_etag(
     client: &reqwest::Client,
     url: &str,
     stored_path: &Path,
     etag_path: &Path,
-) -> Result<String, String> {
+) -> Result<Acquired, String> {
     let mut request = client.get(url);
-
-    // Send If-None-Match if we have a stored etag
-    if let Ok(etag) = std::fs::read_to_string(etag_path) {
-        let etag = etag.trim().to_string();
-        if !etag.is_empty() {
-            request = request.header("If-None-Match", etag);
-        }
+    // An ETag is only meaningful while its body is on disk.
+    if stored_path.is_file()
+        && let Ok(etag) = std::fs::read_to_string(etag_path)
+        && !etag.trim().is_empty()
+    {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag.trim());
     }
 
-    let response = request.send().await.map_err(|e| e.to_string())?;
-
+    let mut response = request.send().await.map_err(|e| error_chain(&e))?;
     let status = response.status();
 
     if status == reqwest::StatusCode::NOT_MODIFIED {
-        // 304: use stored copy
-        return std::fs::read_to_string(stored_path)
-            .map_err(|e| format!("304 but stored copy unreadable: {e}"));
+        let text = std::fs::read_to_string(stored_path)
+            .map_err(|e| format!("304 but the stored copy is unreadable: {e}"))?;
+        // Record the confirmation: the stored copy's mtime is the
+        // moment its content was last known to be current.
+        let touched = std::fs::File::options()
+            .append(true)
+            .open(stored_path)
+            .and_then(|f| f.set_modified(SystemTime::now()));
+        if let Err(e) = touched {
+            tracing::warn!(path = %stored_path.display(), error = %e, "cannot mark stored list as verified");
+        }
+        return Ok(Acquired {
+            text,
+            origin: ListOrigin::NotModified,
+            verified_age_secs: Some(0),
+        });
     }
-
     if !status.is_success() {
         return Err(format!("HTTP {status}"));
     }
-
-    // Extract etag before consuming the response
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_LIST_BYTES as u64)
+    {
+        return Err(format!("body larger than {MAX_LIST_BYTES} bytes"));
+    }
     let etag = response
         .headers()
-        .get("etag")
+        .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
-        .map(String::from);
+        .map(str::to_owned);
 
-    let body = response.text().await.map_err(|e| e.to_string())?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| error_chain(&e))? {
+        if body.len() + chunk.len() > MAX_LIST_BYTES {
+            return Err(format!("body larger than {MAX_LIST_BYTES} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = match String::from_utf8(body) {
+        Ok(text) => text,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    };
 
-    // Sanity-check the payload BEFORE persisting: a captive portal or an
-    // HTML error page served with 200 would otherwise overwrite the last
-    // good copy with garbage and silently disable filtering.
-    let parsed = sumidero_filter::parse_list(&body);
-    if parsed.rules.is_empty() {
+    // A captive portal or an HTML error page served with 200 must not
+    // replace the last good copy.
+    let counts = sumidero_filter::count_rules(&text);
+    if counts.rules == 0 {
         return Err(format!(
-            "fetched content contains no rules ({} rejected lines) — refusing to store it",
-            parsed.issues.len()
+            "body holds no rules ({} rejected lines): refusing to store it",
+            counts.issues
         ));
     }
 
-    // Store body and etag — a body-write failure is logged loudly and the
-    // etag is NOT written (a stored etag without a stored body would make
-    // every future revalidation 304 against a copy that does not exist).
-    match std::fs::write(stored_path, &body) {
-        Ok(()) => {
-            if let Some(etag) = etag {
-                let _ = std::fs::write(etag_path, etag);
+    // Atomic replace: a crash mid-write must never leave a truncated
+    // stored copy. The ETag is written only after its body.
+    match write_atomic(stored_path, text.as_bytes()) {
+        Ok(()) => match etag {
+            Some(etag) => {
+                if let Err(e) = write_atomic(etag_path, etag.as_bytes()) {
+                    tracing::warn!(path = %etag_path.display(), error = %e, "cannot store ETag");
+                    let _ = std::fs::remove_file(etag_path);
+                }
             }
-        }
+            None => {
+                let _ = std::fs::remove_file(etag_path);
+            }
+        },
         Err(e) => {
-            tracing::warn!(
+            tracing::error!(
                 path = %stored_path.display(),
                 error = %e,
-                "cannot persist fetched list to disk"
+                next = "check free space and permissions on list_dir",
+                "cannot persist the downloaded list; it is used from memory only"
             );
             let _ = std::fs::remove_file(etag_path);
         }
     }
 
-    Ok(body)
+    Ok(Acquired {
+        text,
+        origin: ListOrigin::Downloaded,
+        verified_age_secs: Some(0),
+    })
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// `reqwest` errors hide the cause (DNS, TLS, timeout) in `source()`.
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(cause) = cur {
+        out.push_str(": ");
+        out.push_str(&cause.to_string());
+        cur = cause.source();
+    }
+    out
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -352,552 +623,4 @@ fn hex_encode(bytes: &[u8]) -> String {
         write!(s, "{b:02x}").expect("writing to String never fails");
     }
     s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
-
-    /// Minimal HTTP server on 127.0.0.1:0 that serves a fixed response.
-    /// Returns (url, handle). Drop handle to stop.
-    fn spawn_http_server(body: &str, etag: Option<&str>) -> (String, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let url = format!("http://127.0.0.1:{port}/list.txt");
-        let body = body.to_string();
-        let etag = etag.map(String::from);
-
-        let handle = std::thread::spawn(move || {
-            // Accept up to 5 connections for test flexibility
-            for stream in listener.incoming().take(5) {
-                let Ok(mut stream) = stream else { break };
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
-
-                // Check for If-None-Match
-                let has_matching_etag = etag.as_ref().is_some_and(|et| {
-                    request.lines().any(|line| {
-                        line.to_ascii_lowercase().starts_with("if-none-match:")
-                            && line.contains(et.as_str())
-                    })
-                });
-
-                if has_matching_etag {
-                    let response = "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n";
-                    let _ = stream.write_all(response.as_bytes());
-                } else {
-                    let etag_header = etag
-                        .as_ref()
-                        .map(|e| format!("ETag: {e}\r\n"))
-                        .unwrap_or_default();
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{etag_header}Connection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }
-            }
-        });
-
-        (url, handle)
-    }
-
-    /// Spawn a server that always returns an error.
-    fn spawn_error_server() -> (String, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let url = format!("http://127.0.0.1:{port}/list.txt");
-
-        let handle = std::thread::spawn(move || {
-            for stream in listener.incoming().take(3) {
-                let Ok(mut stream) = stream else { break };
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf);
-                let response = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-
-        (url, handle)
-    }
-
-    fn list_content() -> &'static str {
-        "||ads.example.com^\n||tracker.example.com^\n"
-    }
-
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    }
-
-    #[test]
-    fn fresh_fetch_stores_body_and_etag() {
-        let (url, _handle) = spawn_http_server(list_content(), Some("\"abc123\""));
-        let dir = tempfile::tempdir().unwrap();
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some(url),
-            path: None,
-        }];
-        let result = rt().block_on(load(&sources, dir.path(), false)).unwrap();
-        assert_eq!(result.names, vec!["test-list"]);
-        assert_eq!(result.rule_counts, vec![2]);
-        assert!(dir.path().join("test-list.txt").exists());
-        assert!(dir.path().join("test-list.etag").exists());
-        let stored_etag = std::fs::read_to_string(dir.path().join("test-list.etag")).unwrap();
-        assert_eq!(stored_etag.trim(), "\"abc123\"");
-    }
-
-    #[test]
-    fn etag_304_reuses_stored_copy() {
-        let (url, _handle) = spawn_http_server(list_content(), Some("\"v1\""));
-        let dir = tempfile::tempdir().unwrap();
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some(url),
-            path: None,
-        }];
-        // First fetch populates the store
-        let r1 = rt().block_on(load(&sources, dir.path(), false)).unwrap();
-        // Second fetch should get 304
-        let r2 = rt().block_on(load(&sources, dir.path(), false)).unwrap();
-        assert_eq!(r1.hash, r2.hash);
-        assert_eq!(r2.rule_counts, vec![2]);
-    }
-
-    #[test]
-    fn fetch_fail_uses_stored_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        // Pre-populate a stored copy
-        std::fs::write(dir.path().join("test-list.txt"), list_content()).unwrap();
-
-        let (url, _handle) = spawn_error_server();
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some(url),
-            path: None,
-        }];
-
-        let result = rt().block_on(load(&sources, dir.path(), false)).unwrap();
-        assert_eq!(result.rule_counts, vec![2]);
-    }
-
-    #[test]
-    fn fetch_fail_no_stored_copy_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let (url, _handle) = spawn_error_server();
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some(url),
-            path: None,
-        }];
-
-        let err = rt()
-            .block_on(load(&sources, dir.path(), false))
-            .unwrap_err();
-        assert!(matches!(err, ListError::Unavailable { .. }));
-    }
-
-    #[test]
-    fn offline_mode_uses_stored_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("test-list.txt"), list_content()).unwrap();
-
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some("https://example.com/list.txt".into()),
-            path: None,
-        }];
-
-        let result = rt().block_on(load(&sources, dir.path(), true)).unwrap();
-        assert_eq!(result.rule_counts, vec![2]);
-    }
-
-    #[test]
-    fn offline_mode_no_stored_copy_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some("https://example.com/list.txt".into()),
-            path: None,
-        }];
-
-        let err = rt().block_on(load(&sources, dir.path(), true)).unwrap_err();
-        match err {
-            ListError::Unavailable { reason, .. } => {
-                assert_eq!(reason, "offline");
-            }
-            other => panic!("expected Unavailable, got {other}"),
-        }
-    }
-
-    #[test]
-    fn path_only_list_reads_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let list_file = dir.path().join("my-list.txt");
-        std::fs::write(&list_file, list_content()).unwrap();
-        let list_dir = tempfile::tempdir().unwrap();
-
-        let sources = vec![ListSource {
-            name: "local".into(),
-            url: None,
-            path: Some(list_file),
-        }];
-
-        let result = rt()
-            .block_on(load(&sources, list_dir.path(), false))
-            .unwrap();
-        assert_eq!(result.rule_counts, vec![2]);
-    }
-
-    #[test]
-    fn path_only_list_missing_file_is_error() {
-        let list_dir = tempfile::tempdir().unwrap();
-        let sources = vec![ListSource {
-            name: "local".into(),
-            url: None,
-            path: Some(std::path::PathBuf::from("/nonexistent/list.txt")),
-        }];
-
-        let err = rt()
-            .block_on(load(&sources, list_dir.path(), false))
-            .unwrap_err();
-        assert!(matches!(err, ListError::Read { .. }));
-    }
-
-    #[test]
-    fn both_path_and_url_stored_copy_takes_precedence() {
-        // When fetch fails but stored copy exists, stored copy wins over path seed
-        let dir = tempfile::tempdir().unwrap();
-        let stored_content = "||stored.example.com^\n";
-        std::fs::write(dir.path().join("test-list.txt"), stored_content).unwrap();
-
-        let seed_file = dir.path().join("seed.txt");
-        let seed_content = "||seed.example.com^\n";
-        std::fs::write(&seed_file, seed_content).unwrap();
-
-        let (url, _handle) = spawn_error_server();
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some(url),
-            path: Some(seed_file),
-        }];
-
-        let result = rt().block_on(load(&sources, dir.path(), false)).unwrap();
-        // Should use stored copy, not path seed
-        let verdict = result.engine.verdict("stored.example.com");
-        assert!(matches!(verdict, sumidero_filter::Verdict::Block { .. }));
-        // Seed domain should NOT match (stored was used instead)
-        let verdict_seed = result.engine.verdict("seed.example.com");
-        assert!(matches!(verdict_seed, sumidero_filter::Verdict::NoMatch));
-    }
-
-    #[test]
-    fn both_path_and_url_path_seed_fallback() {
-        // When no stored copy and fetch fails, fall back to path seed
-        let dir = tempfile::tempdir().unwrap();
-        let seed_file = dir.path().join("seed.txt");
-        let seed_content = "||seed.example.com^\n";
-        std::fs::write(&seed_file, seed_content).unwrap();
-
-        let (url, _handle) = spawn_error_server();
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some(url),
-            path: Some(seed_file),
-        }];
-
-        let result = rt().block_on(load(&sources, dir.path(), false)).unwrap();
-        let verdict = result.engine.verdict("seed.example.com");
-        assert!(matches!(verdict, sumidero_filter::Verdict::Block { .. }));
-    }
-
-    #[test]
-    fn no_source_is_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let sources = vec![ListSource {
-            name: "broken".into(),
-            url: None,
-            path: None,
-        }];
-        let err = rt()
-            .block_on(load(&sources, dir.path(), false))
-            .unwrap_err();
-        assert!(matches!(err, ListError::NoSource { .. }));
-    }
-
-    #[test]
-    fn hash_stability() {
-        let dir = tempfile::tempdir().unwrap();
-        let list_file = dir.path().join("my-list.txt");
-        std::fs::write(&list_file, list_content()).unwrap();
-        let list_dir = tempfile::tempdir().unwrap();
-
-        let sources = vec![ListSource {
-            name: "local".into(),
-            url: None,
-            path: Some(list_file),
-        }];
-
-        let r1 = rt()
-            .block_on(load(&sources, list_dir.path(), false))
-            .unwrap();
-        let r2 = rt()
-            .block_on(load(&sources, list_dir.path(), false))
-            .unwrap();
-        assert_eq!(r1.hash, r2.hash);
-        assert_eq!(r1.hash.len(), 64);
-    }
-
-    #[test]
-    fn engine_blocks_domain_from_loaded_list() {
-        let (url, _handle) = spawn_http_server("||ads.example.com^\n||tracker.test.org^\n", None);
-        let dir = tempfile::tempdir().unwrap();
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some(url),
-            path: None,
-        }];
-
-        let result = rt().block_on(load(&sources, dir.path(), false)).unwrap();
-        assert!(matches!(
-            result.engine.verdict("ads.example.com"),
-            sumidero_filter::Verdict::Block { .. }
-        ));
-        assert!(matches!(
-            result.engine.verdict("sub.ads.example.com"),
-            sumidero_filter::Verdict::Block { .. }
-        ));
-        assert!(matches!(
-            result.engine.verdict("clean.example.com"),
-            sumidero_filter::Verdict::NoMatch
-        ));
-    }
-
-    #[test]
-    fn list_dir_missing_is_error() {
-        // Online, a missing list_dir is created (see
-        // `missing_list_dir_is_created_online`) — but only where the
-        // daemon may write. A path it cannot create under is still fatal.
-        let sources = vec![ListSource {
-            name: "test".into(),
-            url: Some("https://example.com/list.txt".into()),
-            path: None,
-        }];
-        let err = rt()
-            .block_on(load(&sources, Path::new("/nonexistent/dir"), false))
-            .unwrap_err();
-        assert!(
-            matches!(err, ListError::ListDirCreate { .. }),
-            "expected ListDirCreate, got {err}"
-        );
-    }
-
-    #[test]
-    fn names_and_rule_counts_in_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let list1 = dir.path().join("a.txt");
-        let list2 = dir.path().join("b.txt");
-        std::fs::write(&list1, "||one.com^\n").unwrap();
-        std::fs::write(&list2, "||two.com^\n||three.com^\n").unwrap();
-        let list_dir = tempfile::tempdir().unwrap();
-
-        let sources = vec![
-            ListSource {
-                name: "alpha".into(),
-                url: None,
-                path: Some(list1),
-            },
-            ListSource {
-                name: "beta".into(),
-                url: None,
-                path: Some(list2),
-            },
-        ];
-
-        let result = rt()
-            .block_on(load(&sources, list_dir.path(), false))
-            .unwrap();
-        assert_eq!(result.names, vec!["alpha", "beta"]);
-        assert_eq!(result.rule_counts, vec![1, 2]);
-    }
-
-    #[test]
-    fn parse_issues_reported() {
-        let dir = tempfile::tempdir().unwrap();
-        let list_file = dir.path().join("issues.txt");
-        // A cosmetic rule should produce a parse issue
-        std::fs::write(&list_file, "||ok.com^\n##.banner\n").unwrap();
-        let list_dir = tempfile::tempdir().unwrap();
-
-        let sources = vec![ListSource {
-            name: "issue-list".into(),
-            url: None,
-            path: Some(list_file),
-        }];
-
-        let result = rt()
-            .block_on(load(&sources, list_dir.path(), false))
-            .unwrap();
-        assert_eq!(result.rule_counts, vec![1]);
-        assert_eq!(result.issues.len(), 1);
-        assert_eq!(result.issues[0].0, "issue-list");
-    }
-
-    #[test]
-    fn offline_mode_path_seed_fallback() {
-        // When offline with url+path and no stored copy, use path seed
-        let dir = tempfile::tempdir().unwrap();
-        let seed_file = dir.path().join("seed.txt");
-        std::fs::write(&seed_file, "||seed.example.com^\n").unwrap();
-        let list_dir = tempfile::tempdir().unwrap();
-
-        let sources = vec![ListSource {
-            name: "test-list".into(),
-            url: Some("https://example.com/list.txt".into()),
-            path: Some(seed_file),
-        }];
-
-        let result = rt()
-            .block_on(load(&sources, list_dir.path(), true))
-            .unwrap();
-        assert_eq!(result.rule_counts, vec![1]);
-    }
-
-    #[test]
-    fn hash_differs_by_list_order() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_a = dir.path().join("a.txt");
-        let file_b = dir.path().join("b.txt");
-        std::fs::write(&file_a, "||alpha.com^\n").unwrap();
-        std::fs::write(&file_b, "||beta.com^\n").unwrap();
-        let list_dir = tempfile::tempdir().unwrap();
-
-        let sources_ab = vec![
-            ListSource {
-                name: "a".into(),
-                url: None,
-                path: Some(file_a.clone()),
-            },
-            ListSource {
-                name: "b".into(),
-                url: None,
-                path: Some(file_b.clone()),
-            },
-        ];
-        let sources_ba = vec![
-            ListSource {
-                name: "b".into(),
-                url: None,
-                path: Some(file_b),
-            },
-            ListSource {
-                name: "a".into(),
-                url: None,
-                path: Some(file_a),
-            },
-        ];
-
-        let r_ab = rt()
-            .block_on(load(&sources_ab, list_dir.path(), false))
-            .unwrap();
-        let r_ba = rt()
-            .block_on(load(&sources_ba, list_dir.path(), false))
-            .unwrap();
-        assert_ne!(r_ab.hash, r_ba.hash, "hash must depend on list order");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn list_dir_not_writable_is_error_online() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-
-        let sources = vec![ListSource {
-            name: "test".into(),
-            url: Some("https://example.com/list.txt".into()),
-            path: None,
-        }];
-        let err = rt()
-            .block_on(load(&sources, dir.path(), false))
-            .unwrap_err();
-        assert!(matches!(err, ListError::ListDir(_)));
-
-        // Restore permissions so tempdir cleanup works
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    #[test]
-    fn missing_list_dir_is_created_online() {
-        // A fresh install under systemd's DynamicUser gets an empty
-        // StateDirectory: /var/lib/sumidero exists, /var/lib/sumidero/
-        // lists does not. Refusing to start there would make the
-        // documented install path fail on first boot.
-        let dir = tempfile::tempdir().unwrap();
-        let list_dir = dir.path().join("lists");
-        assert!(!list_dir.exists());
-
-        let sources = vec![ListSource {
-            name: "test".into(),
-            url: Some("https://192.0.2.1/list.txt".into()),
-            path: None,
-        }];
-        // The fetch fails (TEST-NET-1 is unroutable) and there is no
-        // stored copy, so loading still errors — but on the list, not on
-        // the directory, which must now exist.
-        let err = rt().block_on(load(&sources, &list_dir, false)).unwrap_err();
-        assert!(
-            matches!(err, ListError::Unavailable { .. }),
-            "expected a list error, got {err}"
-        );
-        assert!(list_dir.is_dir(), "list_dir should have been created");
-    }
-
-    #[test]
-    fn missing_list_dir_is_not_created_offline() {
-        // `check` validates; it must never materialise state.
-        let dir = tempfile::tempdir().unwrap();
-        let list_dir = dir.path().join("lists");
-
-        let sources = vec![ListSource {
-            name: "test".into(),
-            url: Some("https://example.com/list.txt".into()),
-            path: None,
-        }];
-        let err = rt().block_on(load(&sources, &list_dir, true)).unwrap_err();
-        assert!(matches!(err, ListError::ListDir(_)));
-        assert!(!list_dir.exists(), "check must not create list_dir");
-    }
-
-    #[test]
-    fn uncreatable_list_dir_fails_loudly_with_the_os_error() {
-        let dir = tempfile::tempdir().unwrap();
-        // A regular file where a directory component must be.
-        let blocker = dir.path().join("blocker");
-        std::fs::write(&blocker, b"not a directory").unwrap();
-        let list_dir = blocker.join("lists");
-
-        let sources = vec![ListSource {
-            name: "test".into(),
-            url: Some("https://example.com/list.txt".into()),
-            path: None,
-        }];
-        let err = rt().block_on(load(&sources, &list_dir, false)).unwrap_err();
-        match err {
-            ListError::ListDirCreate { path, source } => {
-                assert_eq!(path, list_dir);
-                // The OS reason must survive to the operator, not be
-                // flattened into "does not exist or is not writable".
-                assert_ne!(source.to_string(), "");
-            }
-            other => panic!("expected ListDirCreate, got {other}"),
-        }
-    }
 }

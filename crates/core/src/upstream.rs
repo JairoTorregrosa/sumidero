@@ -67,6 +67,8 @@ pub struct UpstreamConfig {
     pub bootstrap_ips: Vec<IpAddr>,
     /// Per-upstream query timeout in milliseconds.
     pub timeout_ms: u64,
+    /// Trust anchors added to the public web PKI (`[tls] extra_roots`).
+    pub extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 // ── Internal transport trait ────────────────────────────────────────
@@ -253,13 +255,13 @@ async fn bootstrap_resolve(host: &str, bootstrap_ips: &[IpAddr]) -> Result<IpAdd
 async fn build_transport(
     kind: &UpstreamKind,
     resolved_ip: IpAddr,
+    tls: &Arc<rustls::ClientConfig>,
 ) -> Result<Arc<dyn Transport>, Error> {
     let provider = TokioRuntimeProvider::new();
     match kind {
         UpstreamKind::Https { host, port, path } => {
             let addr = SocketAddr::new(resolved_ip, *port);
-            let client_config = build_rustls_client_config();
-            let exchange = HttpsClientStream::builder(Arc::new(client_config), provider.clone())
+            let exchange = HttpsClientStream::builder(Arc::clone(tls), provider.clone())
                 .exchange(addr, Arc::from(host.as_str()), Arc::from(path.as_str()))
                 .await
                 .map_err(|e| Error::Init(format!("DoH exchange to {host}:{port} failed: {e}")))?;
@@ -270,9 +272,8 @@ async fn build_transport(
         }
         UpstreamKind::Quic { host, port } => {
             let addr = SocketAddr::new(resolved_ip, *port);
-            let client_config = build_rustls_client_config();
             let stream = QuicClientStream::builder()
-                .crypto_config(client_config)
+                .crypto_config((**tls).clone())
                 .build(addr, Arc::from(host.as_str()))
                 .await
                 .map_err(|e| Error::Init(format!("DoQ stream to {host}:{port} failed: {e}")))?;
@@ -309,6 +310,7 @@ struct NetworkFactory {
     kind: UpstreamKind,
     bootstrap_ips: Vec<IpAddr>,
     url: String,
+    tls: Arc<rustls::ClientConfig>,
 }
 
 impl TransportFactory for NetworkFactory {
@@ -318,7 +320,7 @@ impl TransportFactory for NetworkFactory {
                 UpstreamKind::Https { host, .. } | UpstreamKind::Quic { host, .. } => host,
             };
             let ip = bootstrap_resolve(host, &self.bootstrap_ips).await?;
-            build_transport(&self.kind, ip).await
+            build_transport(&self.kind, ip, &self.tls).await
         })
     }
 
@@ -790,15 +792,24 @@ impl ReconnectingUpstream {
     }
 }
 
-fn build_rustls_client_config() -> rustls::ClientConfig {
+/// One TLS client configuration for every upstream connection: the
+/// public web PKI plus the operator's `[tls] extra_roots`.
+fn build_rustls_client_config(
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<rustls::ClientConfig, Error> {
     // Ensure the ring CryptoProvider is installed process-wide (idempotent).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let root_store: rustls::RootCertStore =
+    let mut root_store: rustls::RootCertStore =
         webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-    rustls::ClientConfig::builder()
+    for cert in extra_roots {
+        root_store
+            .add(cert.clone())
+            .map_err(|e| Error::Init(format!("tls.extra_roots: unusable certificate: {e}")))?;
+    }
+    Ok(rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
-        .with_no_client_auth()
+        .with_no_client_auth())
 }
 
 // ── UpstreamPool ────────────────────────────────────────────────────
@@ -862,6 +873,7 @@ impl UpstreamPool {
         }
 
         let timeout = Duration::from_millis(cfg.timeout_ms);
+        let tls = Arc::new(build_rustls_client_config(&cfg.extra_roots)?);
 
         // Validate every URL and build a factory per upstream. Config
         // errors are fatal here — they are not transient, so retrying
@@ -883,6 +895,7 @@ impl UpstreamPool {
                 kind,
                 bootstrap_ips: cfg.bootstrap_ips.clone(),
                 url: raw_url.clone(),
+                tls: Arc::clone(&tls),
             }));
         }
 
@@ -1458,6 +1471,7 @@ mod tests {
             urls: vec![],
             bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
             timeout_ms: 5000,
+            extra_roots: Vec::new(),
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
         assert!(matches!(err, Error::Init(_)));
@@ -1469,6 +1483,7 @@ mod tests {
             urls: vec!["https://dns.example.com/dns-query".into()],
             bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
             timeout_ms: 0,
+            extra_roots: Vec::new(),
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
         assert!(matches!(err, Error::Init(_)));
@@ -1480,6 +1495,7 @@ mod tests {
             urls: vec!["http://bad-scheme.example.com/dns-query".into()],
             bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
             timeout_ms: 5000,
+            extra_roots: Vec::new(),
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
         assert!(matches!(err, Error::UnsupportedUrl(_)));
@@ -1491,6 +1507,7 @@ mod tests {
             urls: vec!["https://dns.example.com/dns-query".into()],
             bootstrap_ips: vec![],
             timeout_ms: 5000,
+            extra_roots: Vec::new(),
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
         assert!(matches!(err, Error::Init(_)));
@@ -2272,6 +2289,7 @@ mod tests {
             urls: vec!["https://dns.cloudflare.com/dns-query".into()],
             bootstrap_ips: vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()],
             timeout_ms: 10_000,
+            extra_roots: Vec::new(),
         };
 
         let pool = UpstreamPool::new(&cfg).await.expect("pool init");

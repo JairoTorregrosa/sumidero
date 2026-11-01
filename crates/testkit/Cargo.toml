@@ -1,0 +1,24 @@
+[package]
+name = "sumidero-testkit"
+description = "Real local servers for sumidero's tests: DoH/DoQ upstreams, an HTTPS list host, a bootstrap resolver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+hickory-proto = "0.26"
+hickory-net = "0.26"
+async-trait = "0.1"
+hickory-server = { version = "0.26", features = ["https-ring", "quic-ring"] }
+rcgen = "0.14"
+rustls = "0.23"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tempfile = "3"
+
+[lints]
+workspace = true

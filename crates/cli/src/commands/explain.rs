@@ -39,7 +39,7 @@ pub fn run(config: &Path, json: bool, domain: &str) -> ExitCode {
     let loaded = match runtime.block_on(sumidero_core::lists::load(
         &cfg.effective_lists(),
         &cfg.filtering.list_dir,
-        true,
+        None,
     )) {
         Ok(l) => l,
         Err(e) => return fail(json, "explain", &e.to_string(), 1),
