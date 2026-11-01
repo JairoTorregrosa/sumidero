@@ -212,6 +212,11 @@ async fn daemon_starts_reloads_refuses_bad_reloads_and_reports_each_step() {
     assert_eq!(code, Some(0), "{out}");
     assert_eq!(out["outcome"]["ok"], true);
     assert_eq!(w.rcode("newly.test").await, ResponseCode::NXDomain);
+    // `explain` reads the same lists from disk and agrees with the
+    // daemon at once, not after the next minute heartbeat.
+    let (code, verdict) = w.cli(&["explain", "newly.test"]);
+    assert_eq!(code, Some(3), "{verdict}");
+    assert_eq!(verdict["hash_match"], true, "{verdict}");
 
     // A new list that cannot be downloaded: the reload fails, the daemon
     // keeps filtering with what it had, and status says why.
