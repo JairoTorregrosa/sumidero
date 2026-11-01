@@ -60,7 +60,6 @@ async fn fixture_with(rules: &str, safe_search: SafeSearch, timeout_ms: u64) -> 
     builder.add_list(&parsed.rules);
     let pipeline = Pipeline::new(
         builder.build(),
-        vec!["test-list".to_string()],
         Cache::new(1024),
         safe_search,
         pool,
@@ -350,7 +349,7 @@ async fn swap_engine_changes_verdicts_without_restart() {
     let parsed = parse_list("||newly-blocked.test^");
     let mut b = EngineBuilder::new();
     b.add_list(&parsed.rules);
-    f.pipeline.swap_engine(b.build(), vec!["v2".to_string()]);
+    f.pipeline.swap_engine(b.build());
     let r2 = f.pipeline.handle_at(&q, CLIENT, Instant::now()).await;
     assert_eq!(r2.metadata.response_code, ResponseCode::NXDomain);
 }

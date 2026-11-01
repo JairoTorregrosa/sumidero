@@ -233,6 +233,9 @@ pub struct DaemonStats {
     pub log_events_dropped_recent: u64,
     /// Per-upstream health, serialized from `UpstreamPool::health()`.
     pub upstreams_json: String,
+    /// Lifecycle report (`daemon::RuntimeReport`): lists in force, last
+    /// reload, pending restart. `{}` before the daemon wrote one.
+    pub runtime_json: String,
 }
 
 /// Aggregate stats over a time window.
@@ -286,7 +289,7 @@ impl std::fmt::Debug for Db {
 /// v2 added `daemon_stats.log_events_dropped_recent`; v3 added the
 /// `rewritten` verdict; see
 /// [`migrate_schema`].
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Schema helpers
@@ -338,7 +341,8 @@ fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             updated_ts INTEGER NOT NULL,
             log_events_dropped INTEGER NOT NULL,
             log_events_dropped_recent INTEGER NOT NULL DEFAULT 0,
-            upstreams_json TEXT NOT NULL
+            upstreams_json TEXT NOT NULL,
+            runtime_json TEXT NOT NULL DEFAULT '{}'
         );
 
         CREATE TABLE IF NOT EXISTS divergences (
@@ -408,6 +412,19 @@ fn migrate_schema(conn: &Connection, from: u32) -> Result<(), DbError> {
                  DROP TABLE queries_v2;
                  CREATE INDEX IF NOT EXISTS idx_queries_ts ON queries(ts);
                  COMMIT;",
+            )?;
+        }
+    }
+    if from < 4 {
+        // v3 -> v4: the lifecycle report next to the upstream health.
+        let has_column = conn
+            .prepare("SELECT * FROM daemon_stats LIMIT 0")?
+            .column_names()
+            .contains(&"runtime_json");
+        if !has_column {
+            conn.execute(
+                "ALTER TABLE daemon_stats ADD COLUMN runtime_json TEXT NOT NULL DEFAULT '{}'",
+                [],
             )?;
         }
     }
@@ -747,14 +764,33 @@ impl Db {
         let conn = open_write_conn(&self.path)?;
         conn.execute(
             "INSERT OR REPLACE INTO daemon_stats \
-             (id, updated_ts, log_events_dropped, log_events_dropped_recent, upstreams_json) \
-             VALUES (1, ?1, ?2, ?3, ?4)",
+             (id, updated_ts, log_events_dropped, log_events_dropped_recent, upstreams_json, runtime_json) \
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)",
             params![
                 stats.updated_ts,
                 stats.log_events_dropped.cast_signed(),
                 stats.log_events_dropped_recent.cast_signed(),
                 stats.upstreams_json,
+                stats.runtime_json,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Replace only the lifecycle report (a reload just finished; the
+    /// counters keep their last heartbeat values).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] on SQL failure.
+    pub fn write_runtime(&self, updated_ts: i64, runtime_json: &str) -> Result<(), DbError> {
+        let conn = open_write_conn(&self.path)?;
+        conn.execute(
+            "INSERT INTO daemon_stats \
+             (id, updated_ts, log_events_dropped, log_events_dropped_recent, upstreams_json, runtime_json) \
+             VALUES (1, ?1, 0, 0, '{}', ?2) \
+             ON CONFLICT(id) DO UPDATE SET updated_ts = excluded.updated_ts, runtime_json = excluded.runtime_json",
+            params![updated_ts, runtime_json],
         )?;
         Ok(())
     }
@@ -767,8 +803,8 @@ impl Db {
     pub fn daemon_stats(&self) -> Result<Option<DaemonStats>, DbError> {
         let conn = open_read_conn(&self.path)?;
         let mut stmt = conn.prepare(
-            "SELECT updated_ts, log_events_dropped, log_events_dropped_recent, upstreams_json \
-             FROM daemon_stats WHERE id = 1",
+            "SELECT updated_ts, log_events_dropped, log_events_dropped_recent, upstreams_json, \
+             runtime_json FROM daemon_stats WHERE id = 1",
         )?;
         let result = stmt.query_row([], |row| {
             let dropped: i64 = row.get(1)?;
@@ -778,6 +814,7 @@ impl Db {
                 log_events_dropped: dropped.cast_unsigned(),
                 log_events_dropped_recent: recent.cast_unsigned(),
                 upstreams_json: row.get(3)?,
+                runtime_json: row.get(4)?,
             })
         });
         match result {
@@ -1154,6 +1191,7 @@ mod tests {
             log_events_dropped: 9,
             log_events_dropped_recent: 2,
             upstreams_json: "{\"upstreams\":[]}".into(),
+            runtime_json: "{}".into(),
         })
         .unwrap();
         let stats = db.daemon_stats().unwrap().unwrap();
@@ -1367,6 +1405,7 @@ mod tests {
             log_events_dropped: 0,
             log_events_dropped_recent: 0,
             upstreams_json: r#"[{"url":"https://dns.google/dns-query","connected":true}]"#.into(),
+            runtime_json: "{}".into(),
         };
         db.write_daemon_stats(&first).unwrap();
         assert_eq!(db.daemon_stats().unwrap(), Some(first));
@@ -1376,6 +1415,7 @@ mod tests {
             log_events_dropped: 42,
             log_events_dropped_recent: 42,
             upstreams_json: r#"[{"url":"https://dns.google/dns-query","connected":false}]"#.into(),
+            runtime_json: "{}".into(),
         };
         db.write_daemon_stats(&second).unwrap();
         assert_eq!(db.daemon_stats().unwrap(), Some(second));

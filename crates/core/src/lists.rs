@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{Name, RData, RecordType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sumidero_filter::{IssueReason, LineIssue};
 
@@ -75,7 +75,7 @@ pub enum ListError {
 
 /// Where a list's rules came from on this load. `as_str` values are
 /// stable reason codes (logs, `status`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "origin", rename_all = "snake_case")]
 pub enum ListOrigin {
     /// 200: a new body was stored.
@@ -120,7 +120,7 @@ impl ListOrigin {
 }
 
 /// What one load did with one list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListReport {
     pub name: String,
     #[serde(flatten)]

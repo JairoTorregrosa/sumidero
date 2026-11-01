@@ -26,9 +26,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use ipnet::IpNet;
 use sumidero_filter::{Engine, Verdict};
 
-use crate::CoreError;
 use crate::cache::{Cache, CacheKey, Lookup};
-use crate::config::Config;
 use crate::db::{DbWriter, LogEvent, QueryRecord, ResponseSource, VerdictKind};
 use crate::safesearch::SafeSearch;
 
@@ -189,22 +187,23 @@ impl Drop for RemoveFromSetOnDrop {
     }
 }
 
-/// The engine plus the list names it was built from, swapped atomically.
-struct EngineState {
-    engine: Engine,
-    #[expect(dead_code, reason = "used by explain/logging in phase 3")]
-    list_names: Vec<String>,
+/// Everything that decides an answer, swapped as one value: a query sees
+/// one consistent policy from its first check to its CNAME check, and a
+/// reload can never pair new lists with an old allowlist.
+#[derive(Clone)]
+pub struct Policy {
+    pub engine: Arc<Engine>,
+    pub safesearch: Arc<SafeSearch>,
+    pub allow: Arc<[IpNet]>,
 }
 
-/// The assembled request pipeline, generic over the upstream so tests can
-/// inject a mock.
+/// The assembled request pipeline, generic over the upstream (the pool
+/// in production; a test can pass any `Upstream`).
 pub struct Pipeline<U: Upstream> {
-    state: ArcSwap<EngineState>,
+    policy: ArcSwap<Policy>,
     cache: Arc<Cache>,
-    safesearch: ArcSwap<SafeSearch>,
     upstream: Arc<U>,
     writer: DbWriter,
-    allow: ArcSwap<Vec<IpNet>>,
     /// Queries currently inside `handle_at` (graceful shutdown drains it).
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     /// Cache keys with a serve-stale refresh already running (dedup).
@@ -227,20 +226,31 @@ impl<U: Upstream> Pipeline<U> {
     #[must_use]
     pub fn new(
         engine: Engine,
-        list_names: Vec<String>,
         cache: Cache,
         safesearch: SafeSearch,
         upstream: U,
         writer: DbWriter,
         allow: Vec<IpNet>,
     ) -> Self {
+        Self::from_policy(
+            Policy {
+                engine: Arc::new(engine),
+                safesearch: Arc::new(safesearch),
+                allow: allow.into(),
+            },
+            cache,
+            upstream,
+            writer,
+        )
+    }
+
+    #[must_use]
+    pub fn from_policy(policy: Policy, cache: Cache, upstream: U, writer: DbWriter) -> Self {
         Self {
-            state: ArcSwap::from_pointee(EngineState { engine, list_names }),
+            policy: ArcSwap::from_pointee(policy),
             cache: Arc::new(cache),
-            safesearch: ArcSwap::from_pointee(safesearch),
             upstream: Arc::new(upstream),
             writer,
-            allow: ArcSwap::from_pointee(allow),
             in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             refreshing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             lookups: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -268,10 +278,25 @@ impl<U: Upstream> Pipeline<U> {
         self.shadow = Some(crate::shadow::Shadow::new(addr));
     }
 
-    /// Swap the client allowlist and safe-search table (SIGHUP reload).
+    /// The policy in force.
+    #[must_use]
+    pub fn policy(&self) -> Arc<Policy> {
+        self.policy.load_full()
+    }
+
+    /// Install a whole new policy in one atomic step (reload).
+    pub fn install(&self, policy: Policy) {
+        self.policy.store(Arc::new(policy));
+    }
+
+    /// Keep the engine, replace the allowlist and safe-search table.
     pub fn swap_policy(&self, safesearch: SafeSearch, allow: Vec<IpNet>) {
-        self.safesearch.store(Arc::new(safesearch));
-        self.allow.store(Arc::new(allow));
+        let engine = Arc::clone(&self.policy.load().engine);
+        self.install(Policy {
+            engine,
+            safesearch: Arc::new(safesearch),
+            allow: allow.into(),
+        });
     }
 
     /// Number of queries currently being handled.
@@ -280,10 +305,14 @@ impl<U: Upstream> Pipeline<U> {
         self.in_flight.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Swap in a new engine (SIGHUP reload / periodic list refresh).
-    pub fn swap_engine(&self, engine: Engine, list_names: Vec<String>) {
-        self.state
-            .store(Arc::new(EngineState { engine, list_names }));
+    /// Keep the allowlist and safe search, replace the engine.
+    pub fn swap_engine(&self, engine: Engine) {
+        let current = self.policy.load_full();
+        self.install(Policy {
+            engine: Arc::new(engine),
+            safesearch: Arc::clone(&current.safesearch),
+            allow: Arc::clone(&current.allow),
+        });
     }
 
     /// Answer one request at the current wall-clock instant.
@@ -334,7 +363,11 @@ impl<U: Upstream> Pipeline<U> {
             ResponseSource::Synth,
         );
 
-        if !client_allowed(&self.allow.load(), client) {
+        // One policy snapshot for the whole query: the CNAME check after
+        // the upstream answer judges with the same engine as the name
+        // itself, even if a reload lands in between.
+        let policy = self.policy.load_full();
+        if !client_allowed(&policy.allow, client) {
             let resp = synth_refused(request);
             self.finish(&mut log, &resp, started);
             return resp;
@@ -346,11 +379,7 @@ impl<U: Upstream> Pipeline<U> {
         }
 
         // Filter verdict.
-        // One policy snapshot for the whole query: the CNAME check after
-        // the upstream answer must judge with the same engine as the
-        // name itself, even if a reload lands in between.
-        let state = self.state.load_full();
-        match state.engine.verdict(&qname) {
+        match policy.engine.verdict(&qname) {
             Verdict::Block { list, rule } => {
                 log.verdict = VerdictKind::Blocked;
                 log.rule = Some(rule.text.to_string());
@@ -369,8 +398,7 @@ impl<U: Upstream> Pipeline<U> {
         }
 
         // Safe-search rewrite.
-        let safesearch = self.safesearch.load();
-        if let Some(target) = safesearch.rewrite(&qname) {
+        if let Some(target) = policy.safesearch.rewrite(&qname) {
             log.verdict = VerdictKind::Rewritten;
             log.rule = Some(format!("safe-search -> {target}"));
             let resp = self
@@ -389,7 +417,7 @@ impl<U: Upstream> Pipeline<U> {
         // when any name in the chain is. An exception on the queried name
         // covers its whole chain, the way the operator wrote it.
         if log.verdict != VerdictKind::Excepted
-            && let Some((target, list, rule)) = blocked_cname_target(&state.engine, &resp)
+            && let Some((target, list, rule)) = blocked_cname_target(&policy.engine, &resp)
         {
             log.verdict = VerdictKind::Blocked;
             log.rule = Some(format!("{rule} (CNAME target {target})"));
@@ -749,7 +777,7 @@ fn restamp(mut msg: Message, request: &Message) -> Message {
     msg
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().cast_signed())
@@ -843,11 +871,8 @@ fn bind_udp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket
 /// Bind UDP+TCP on every address (TCP first, then UDP on the same
 /// resolved port, so `:0` ends up on one port for both) and serve
 /// requests through the pipeline until shutdown.
-#[expect(
-    clippy::unused_async,
-    reason = "binding is synchronous now, but this spawns the socket tasks \
-              and so must run inside a runtime; the async signature enforces that"
-)]
+// Async although binding is synchronous: it spawns the socket tasks and
+// so must run inside a runtime; the signature enforces that.
 pub async fn serve<U: Upstream>(
     pipeline: std::sync::Arc<Pipeline<U>>,
     binds: &[std::net::SocketAddr],
@@ -965,241 +990,4 @@ async fn serve_tcp_conn<U: Upstream>(
         stream.write_all(&len.to_be_bytes()).await?;
         stream.write_all(&bytes).await?;
     }
-}
-
-// ---------------------------------------------------------------------------
-// daemon entry
-// ---------------------------------------------------------------------------
-
-/// Reload lists and swap the engine; on any failure the old engine stays.
-async fn reload_lists<U: Upstream>(
-    config: &Config,
-    pipeline: &Pipeline<U>,
-    db: &crate::db::Db,
-    started_ts: i64,
-    fetcher: &crate::lists::Fetcher,
-) -> Result<String, CoreError> {
-    let loaded = crate::lists::load(
-        &config.effective_lists(),
-        &config.filtering.list_dir,
-        Some(fetcher),
-    )
-    .await?;
-    let hash = loaded.hash.clone();
-    tracing::info!(
-        rules = loaded.total_rules(),
-        lists = loaded.names.len(),
-        hash,
-        "filter engine ready"
-    );
-    pipeline.swap_engine(loaded.engine, loaded.names);
-    let hb = crate::db::Heartbeat {
-        pid: std::process::id(),
-        started_ts,
-        updated_ts: unix_now(),
-        config_hash: config.hash(),
-        lists_hash: hash.clone(),
-    };
-    db.write_heartbeat(&hb)?;
-    Ok(hash)
-}
-
-/// Run the daemon from a config file: fail loud on any startup problem,
-/// serve until SIGTERM/SIGINT, reload config+lists on SIGHUP, refresh
-/// lists daily, heartbeat every minute, retention sweep hourly.
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear startup + event loop, no branching logic"
-)]
-pub async fn run(
-    config_path: &std::path::Path,
-    shadow: Option<std::net::SocketAddr>,
-) -> Result<(), CoreError> {
-    let config = Config::load(config_path)?;
-    let db = crate::db::Db::open(&config.database.path)?;
-    let started_ts = unix_now();
-
-    let safesearch = SafeSearch::new(config.safe_search.enabled, &config.safe_search.providers)?;
-
-    let extra_roots = config.extra_roots()?;
-    let pool = std::sync::Arc::new(
-        crate::upstream::UpstreamPool::new(&crate::upstream::UpstreamConfig {
-            urls: config.upstreams.servers.clone(),
-            bootstrap_ips: config.upstreams.bootstrap.clone(),
-            timeout_ms: config.upstreams.timeout_ms,
-            extra_roots: extra_roots.clone(),
-        })
-        .await?,
-    );
-    let fetcher = crate::lists::Fetcher::new(&extra_roots, std::sync::Arc::clone(&pool))?;
-
-    // Start with an empty engine, then load lists (online, fail loud)
-    // BEFORE binding any socket: never serve unfiltered.
-    let mut pipeline = Pipeline::new(
-        sumidero_filter::EngineBuilder::new().build(),
-        Vec::new(),
-        Cache::with_limits(
-            config.cache.max_entries,
-            crate::cache::DEFAULT_MAX_BYTES,
-            config.cache.serve_stale_secs,
-        ),
-        safesearch,
-        pool,
-        db.writer(),
-        config.server.allow.clone(),
-    );
-    if let Some(addr) = shadow {
-        tracing::info!(%addr, "shadow mode: mirroring queries to reference resolver");
-        pipeline.set_shadow(addr);
-    }
-    let pipeline = std::sync::Arc::new(pipeline);
-    let mut lists_hash = reload_lists(&config, &pipeline, &db, started_ts, &fetcher).await?;
-
-    let server = serve(std::sync::Arc::clone(&pipeline), &config.server.bind).await?;
-    tracing::info!(udp = ?server.udp_addrs, tcp = ?server.tcp_addrs, "serving");
-
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut heartbeat = tokio::time::interval(std::time::Duration::from_mins(1));
-    let mut retention = tokio::time::interval(std::time::Duration::from_hours(1));
-    let mut refresh = tokio::time::interval(std::time::Duration::from_secs(
-        crate::consts::LIST_UPDATE_SECS,
-    ));
-    // The first tick of an interval fires immediately; consume them.
-    heartbeat.tick().await;
-    retention.tick().await;
-    refresh.tick().await;
-
-    let mut current_config = config;
-    // Drop count at the previous heartbeat, so each sample can report
-    // what was lost *since then* rather than since process start.
-    let mut dropped_at_last_sample: u64 = 0;
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            _ = sigterm.recv() => break,
-            _ = sighup.recv() => {
-                // nginx pattern: re-read config; a bad config or unloadable
-                // lists keep the old state and log loudly.
-                match Config::load(config_path) {
-                    Ok(new_config) => {
-                        match reload_lists(&new_config, &pipeline, &db, started_ts, &fetcher).await {
-                            Ok(hash) => {
-                                match SafeSearch::new(
-                                    new_config.safe_search.enabled,
-                                    &new_config.safe_search.providers,
-                                ) {
-                                    Ok(ss) => pipeline
-                                        .swap_policy(ss, new_config.server.allow.clone()),
-                                    Err(err) => tracing::error!(
-                                        %err,
-                                        "safe-search reload failed; keeping old table"
-                                    ),
-                                }
-                                if new_config.server.bind != current_config.server.bind
-                                    || new_config.upstreams != current_config.upstreams
-                                    || new_config.database != current_config.database
-                                {
-                                    tracing::warn!(
-                                        "bind/upstream/database changes need a restart; \
-                                         filtering, allowlist, and safe-search were reloaded"
-                                    );
-                                }
-                                current_config = new_config;
-                                lists_hash = hash;
-                                tracing::info!("reload complete");
-                            }
-                            Err(err) => {
-                                tracing::error!(%err, "reload failed; keeping old lists");
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!(%err, "reload failed: bad config; keeping old state");
-                    }
-                }
-            }
-            _ = heartbeat.tick() => {
-                let hb = crate::db::Heartbeat {
-                    pid: std::process::id(),
-                    started_ts,
-                    updated_ts: unix_now(),
-                    config_hash: current_config.hash(),
-                    lists_hash: lists_hash.clone(),
-                };
-                // rusqlite is blocking; keep it off the async workers.
-                let result = tokio::task::block_in_place(|| db.write_heartbeat(&hb));
-                if let Err(err) = result {
-                    tracing::error!(%err, "heartbeat write failed");
-                }
-
-                // Publish runtime counters next to the heartbeat so a
-                // degraded daemon is visible from `status` alone.
-                let health = pipeline.upstream().health();
-                // Only "no upstream could answer" is worth a warning: a
-                // single dropped connection is rebuilt on the next query
-                // and the race hides it from clients entirely.
-                if health.consecutive_all_failed > 0 {
-                    tracing::error!(
-                        consecutive = health.consecutive_all_failed,
-                        total = health.all_failed_total,
-                        "every upstream is failing; the daemon cannot resolve"
-                    );
-                }
-                match serde_json::to_string(&health) {
-                    Ok(upstreams_json) => {
-                        let dropped_total = pipeline.log_events_dropped();
-                        let dropped_recent =
-                            dropped_total.saturating_sub(dropped_at_last_sample);
-                        dropped_at_last_sample = dropped_total;
-                        if dropped_recent > 0 {
-                            tracing::warn!(
-                                dropped_recent,
-                                dropped_total,
-                                "query-log events dropped: the writer queue is full"
-                            );
-                        }
-                        let stats = crate::db::DaemonStats {
-                            updated_ts: unix_now(),
-                            log_events_dropped: dropped_total,
-                            log_events_dropped_recent: dropped_recent,
-                            upstreams_json,
-                        };
-                        let result =
-                            tokio::task::block_in_place(|| db.write_daemon_stats(&stats));
-                        if let Err(err) = result {
-                            tracing::error!(%err, "daemon stats write failed");
-                        }
-                    }
-                    Err(err) => tracing::error!(%err, "upstream health serialization failed"),
-                }
-            }
-            _ = retention.tick() => {
-                match tokio::task::block_in_place(|| db.retention_sweep(unix_now())) {
-                    Ok(deleted) if deleted > 0 => tracing::info!(deleted, "retention sweep"),
-                    Ok(_) => {}
-                    Err(err) => tracing::error!(%err, "retention sweep failed"),
-                }
-            }
-            _ = refresh.tick() => {
-                match reload_lists(&current_config, &pipeline, &db, started_ts, &fetcher).await {
-                    Ok(hash) => lists_hash = hash,
-                    Err(err) => {
-                        tracing::error!(%err, "daily list refresh failed; keeping old lists");
-                    }
-                }
-            }
-        }
-    }
-
-    tracing::info!("shutting down");
-    server.shutdown().await;
-    // Drain in-flight queries (bounded) so their log records reach the
-    // writer before the final flush.
-    let drain_deadline = Instant::now() + std::time::Duration::from_secs(2);
-    while pipeline.in_flight() > 0 && Instant::now() < drain_deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    tokio::task::block_in_place(|| db.flush());
-    Ok(())
 }

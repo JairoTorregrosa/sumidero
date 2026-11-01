@@ -14,7 +14,8 @@
 //! | 4 | `explain`: name matches an exception |
 //! | 5 | daemon not running or heartbeat stale (`status`, `reload`) |
 //! | 6 | refusing to overwrite an existing file (`init`, `migrate`) |
-//! | 7 | `status`: daemon running but degraded (cannot resolve, or dropping log events) |
+//! | 7 | `status`: daemon running but degraded (`degraded_reasons` says why) |
+//! | 8 | `reload`: signalled, but the daemon reported no outcome within `--wait-secs` |
 
 mod commands;
 mod output;
@@ -88,8 +89,14 @@ enum Command {
     },
     /// Validate the config file and the loadability of its blocklists.
     Check,
-    /// Validate config, then signal the running daemon to reload (SIGHUP).
-    Reload,
+    /// Validate config, signal the running daemon to reload (SIGHUP) and
+    /// wait for its outcome.
+    Reload {
+        /// Seconds to wait for the daemon's outcome (lists may download);
+        /// 0 returns right after signalling.
+        #[arg(long, default_value_t = 300)]
+        wait_secs: u64,
+    },
     /// Write a commented starter config.
     Init {
         /// Filtering profile for the starter config.
@@ -148,7 +155,7 @@ fn main() -> ExitCode {
         Command::Stats { hours } => commands::stats::run(&config, json, hours),
         Command::Explain { domain } => commands::explain::run(&config, json, &domain),
         Command::Check => commands::check::run(&config, json),
-        Command::Reload => commands::reload::run(&config, json),
+        Command::Reload { wait_secs } => commands::reload::run(&config, json, wait_secs),
         Command::Init {
             profile,
             out,
