@@ -202,6 +202,7 @@ async fn build_target(spec: &str) -> Target {
                 "9.9.9.9".parse().expect("static IP"),
             ],
             timeout_ms: TIMEOUT_MS,
+            extra_roots: Vec::new(),
         };
         let pool = UpstreamPool::new(&cfg)
             .await

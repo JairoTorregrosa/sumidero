@@ -42,6 +42,64 @@ pub struct Config {
     pub database: DatabaseConfig,
     #[serde(default, skip_serializing_if = "is_default_safe_search")]
     pub safe_search: SafeSearchConfig,
+    #[serde(default, skip_serializing_if = "TlsConfig::is_default")]
+    pub tls: TlsConfig,
+}
+
+/// Extra trust anchors for every TLS connection the daemon makes
+/// (upstreams and list downloads), on top of the public web PKI. For a
+/// private resolver or list mirror with its own CA.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM files (absolute paths), each holding at least one certificate.
+    #[serde(default)]
+    pub extra_roots: Vec<PathBuf>,
+}
+
+impl TlsConfig {
+    fn is_default(&self) -> bool {
+        self.extra_roots.is_empty()
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self.extra_roots.iter().find(|p| !p.is_absolute()) {
+            Some(path) => Err(ConfigError::Invalid(format!(
+                "tls.extra_roots: {} must be absolute",
+                path.display()
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Read the `[tls] extra_roots` PEM files. A missing file, or one with
+/// no certificate in it, is an error: a trust anchor the operator
+/// configured must never be silently absent.
+///
+/// # Errors
+///
+/// [`ConfigError::Invalid`] naming the file and the reason.
+pub fn read_extra_roots(
+    tls: &TlsConfig,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, ConfigError> {
+    use rustls::pki_types::pem::PemObject;
+    let mut out = Vec::new();
+    for path in &tls.extra_roots {
+        let certs = rustls::pki_types::CertificateDer::pem_file_iter(path)
+            .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+            .map_err(|e| {
+                ConfigError::Invalid(format!("tls.extra_roots: {}: {e}", path.display()))
+            })?;
+        if certs.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "tls.extra_roots: {}: no certificate found",
+                path.display()
+            )));
+        }
+        out.extend(certs);
+    }
+    Ok(out)
 }
 
 fn is_default_safe_search(s: &SafeSearchConfig) -> bool {
@@ -191,6 +249,17 @@ impl Config {
         hex_encode(&digest)
     }
 
+    /// Trust anchors from `[tls] extra_roots`; see [`read_extra_roots`].
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Invalid`] naming the file and the reason.
+    pub fn extra_roots(
+        &self,
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, ConfigError> {
+        read_extra_roots(&self.tls)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         // server.bind non-empty
         if self.server.bind.is_empty() {
@@ -244,6 +313,7 @@ impl Config {
                 self.filtering.list_dir.display()
             )));
         }
+        self.tls.validate()?;
         crate::safesearch::validate_providers(&self.safe_search.providers)
             .map_err(|e| ConfigError::Invalid(format!("safe_search.providers: {e}")))?;
         // filtering must yield at least one effective list

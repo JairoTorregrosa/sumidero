@@ -61,6 +61,17 @@ impl Upstream for crate::upstream::UpstreamPool {
     }
 }
 
+/// The daemon shares one pool between the pipeline and the list
+/// fetcher's resolver.
+impl<T: Upstream> Upstream for std::sync::Arc<T> {
+    fn resolve(
+        &self,
+        query: &Message,
+    ) -> impl std::future::Future<Output = Result<Message, crate::upstream::Error>> + Send {
+        T::resolve(self, query)
+    }
+}
+
 /// Is this client allowed to query?
 #[must_use]
 pub fn client_allowed(allow: &[IpNet], client: IpAddr) -> bool {
@@ -878,20 +889,17 @@ async fn reload_lists<U: Upstream>(
     pipeline: &Pipeline<U>,
     db: &crate::db::Db,
     started_ts: i64,
-    offline: bool,
+    fetcher: &crate::lists::Fetcher,
 ) -> Result<String, CoreError> {
     let loaded = crate::lists::load(
         &config.effective_lists(),
         &config.filtering.list_dir,
-        offline,
+        Some(fetcher),
     )
     .await?;
-    for (list, issue) in &loaded.issues {
-        tracing::warn!(list, %issue, "blocklist line rejected");
-    }
     let hash = loaded.hash.clone();
     tracing::info!(
-        rules = loaded.rule_counts.iter().sum::<usize>(),
+        rules = loaded.total_rules(),
         lists = loaded.names.len(),
         hash,
         "filter engine ready"
@@ -925,12 +933,17 @@ pub async fn run(
 
     let safesearch = SafeSearch::new(config.safe_search.enabled, &config.safe_search.providers)?;
 
-    let pool = crate::upstream::UpstreamPool::new(&crate::upstream::UpstreamConfig {
-        urls: config.upstreams.servers.clone(),
-        bootstrap_ips: config.upstreams.bootstrap.clone(),
-        timeout_ms: config.upstreams.timeout_ms,
-    })
-    .await?;
+    let extra_roots = config.extra_roots()?;
+    let pool = std::sync::Arc::new(
+        crate::upstream::UpstreamPool::new(&crate::upstream::UpstreamConfig {
+            urls: config.upstreams.servers.clone(),
+            bootstrap_ips: config.upstreams.bootstrap.clone(),
+            timeout_ms: config.upstreams.timeout_ms,
+            extra_roots: extra_roots.clone(),
+        })
+        .await?,
+    );
+    let fetcher = crate::lists::Fetcher::new(&extra_roots, std::sync::Arc::clone(&pool))?;
 
     // Start with an empty engine, then load lists (online, fail loud)
     // BEFORE binding any socket: never serve unfiltered.
@@ -948,7 +961,7 @@ pub async fn run(
         pipeline.set_shadow(addr);
     }
     let pipeline = std::sync::Arc::new(pipeline);
-    let mut lists_hash = reload_lists(&config, &pipeline, &db, started_ts, false).await?;
+    let mut lists_hash = reload_lists(&config, &pipeline, &db, started_ts, &fetcher).await?;
 
     let server = serve(std::sync::Arc::clone(&pipeline), &config.server.bind).await?;
     tracing::info!(udp = ?server.udp_addrs, tcp = ?server.tcp_addrs, "serving");
@@ -978,7 +991,7 @@ pub async fn run(
                 // lists keep the old state and log loudly.
                 match Config::load(config_path) {
                     Ok(new_config) => {
-                        match reload_lists(&new_config, &pipeline, &db, started_ts, false).await {
+                        match reload_lists(&new_config, &pipeline, &db, started_ts, &fetcher).await {
                             Ok(hash) => {
                                 match SafeSearch::new(
                                     new_config.safe_search.enabled,
@@ -1077,7 +1090,7 @@ pub async fn run(
                 }
             }
             _ = refresh.tick() => {
-                match reload_lists(&current_config, &pipeline, &db, started_ts, false).await {
+                match reload_lists(&current_config, &pipeline, &db, started_ts, &fetcher).await {
                     Ok(hash) => lists_hash = hash,
                     Err(err) => {
                         tracing::error!(%err, "daily list refresh failed; keeping old lists");
