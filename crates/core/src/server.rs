@@ -219,6 +219,8 @@ pub struct Pipeline<U: Upstream> {
     >,
     /// Shadow-mode reference resolver, when enabled.
     shadow: Option<crate::shadow::Shadow>,
+    /// Recent resolution failures (RFC 9520 hold-downs).
+    failures: Arc<crate::failcache::FailureCache>,
 }
 
 impl<U: Upstream> Pipeline<U> {
@@ -243,6 +245,7 @@ impl<U: Upstream> Pipeline<U> {
             refreshing: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             lookups: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             shadow: None,
+            failures: Arc::new(crate::failcache::FailureCache::new()),
         }
     }
 
@@ -478,7 +481,12 @@ impl<U: Upstream> Pipeline<U> {
                 self.spawn_refresh(request.clone(), key);
                 (restamp(cached, request), ResponseSource::Stale)
             }
-            Lookup::Miss => self.resolve_shared(request, qname, key, now).await,
+            Lookup::Miss => {
+                if self.failures.held(&key, now).is_some() {
+                    return (synth_servfail(request), ResponseSource::FailureCached);
+                }
+                self.resolve_shared(request, qname, key, now).await
+            }
         }
     }
 
@@ -524,14 +532,21 @@ impl<U: Upstream> Pipeline<U> {
                 lookups: Arc::clone(&self.lookups),
                 key: key.clone(),
             };
+            let failures = Arc::clone(&self.failures);
             tokio::spawn(async move {
                 let answer = match upstream.resolve(&req).await {
                     Ok(answer) => {
-                        cache.insert(key.clone(), &answer, now);
+                        settle(&cache, &failures, key.clone(), &answer, now, &qname);
                         Some(answer)
                     }
                     Err(err) => {
-                        tracing::warn!(qname, %err, "all upstreams failed");
+                        let hold = failures.record(key.clone(), now);
+                        tracing::warn!(
+                            qname,
+                            %err,
+                            hold_s = hold.as_secs(),
+                            "no upstream could resolve; repeats get SERVFAIL until the hold ends"
+                        );
                         None
                     }
                 };
@@ -570,14 +585,21 @@ impl<U: Upstream> Pipeline<U> {
             refreshing: Arc::clone(&self.refreshing),
             key: key.clone(),
         };
+        let failures = Arc::clone(&self.failures);
         tokio::spawn(async move {
             let _cleanup = cleanup;
+            // Fresh Instant: the entry's clock starts when the answer
+            // arrived, not when the stale hit happened.
+            let now = Instant::now();
+            if failures.held(&key, now).is_some() {
+                return; // failed moments ago; keep serving stale
+            }
+            let qname = key_name(&key);
             match upstream.resolve(&request).await {
-                // Fresh Instant: the entry's clock starts when the answer
-                // arrived, not when the stale hit happened.
-                Ok(answer) => cache.insert(key, &answer, Instant::now()),
+                Ok(answer) => settle(&cache, &failures, key, &answer, now, &qname),
                 Err(err) => {
-                    tracing::warn!(%err, "stale refresh failed");
+                    let hold = failures.record(key, now);
+                    tracing::warn!(qname, %err, hold_s = hold.as_secs(), "stale refresh failed; still serving stale");
                 }
             }
         });
@@ -632,6 +654,34 @@ impl<U: Upstream> Pipeline<U> {
             tracing::warn!("query log queue full; dropped a record");
         }
     }
+}
+
+/// File an upstream answer: cacheable answers go to the cache and clear
+/// the key's failure streak; an upstream SERVFAIL is a resolution
+/// failure (RFC 9520) and starts or extends a hold-down.
+fn settle(
+    cache: &Cache,
+    failures: &crate::failcache::FailureCache,
+    key: CacheKey,
+    answer: &Message,
+    now: Instant,
+    qname: &str,
+) {
+    if answer.metadata.response_code == ResponseCode::ServFail {
+        let hold = failures.record(key, now);
+        tracing::warn!(
+            qname,
+            hold_s = hold.as_secs(),
+            "upstream answered SERVFAIL; holding the name down"
+        );
+    } else {
+        failures.clear(&key);
+        cache.insert(key, answer, now);
+    }
+}
+
+fn key_name(key: &CacheKey) -> String {
+    normalize_qname(&key.name().to_ascii())
 }
 
 /// Lowercase, strip one trailing dot.
@@ -950,7 +1000,11 @@ pub async fn run(
     let mut pipeline = Pipeline::new(
         sumidero_filter::EngineBuilder::new().build(),
         Vec::new(),
-        Cache::new(16_384),
+        Cache::with_limits(
+            config.cache.max_entries,
+            crate::cache::DEFAULT_MAX_BYTES,
+            config.cache.serve_stale_secs,
+        ),
         safesearch,
         pool,
         db.writer(),

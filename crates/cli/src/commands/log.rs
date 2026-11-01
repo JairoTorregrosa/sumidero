@@ -14,13 +14,7 @@ pub(crate) fn verdict_str(v: VerdictKind) -> &'static str {
 }
 
 pub(crate) fn source_str(s: ResponseSource) -> &'static str {
-    match s {
-        ResponseSource::Synth => "synth",
-        ResponseSource::Cache => "cache",
-        ResponseSource::Stale => "stale",
-        ResponseSource::Upstream => "upstream",
-        ResponseSource::Failed => "failed",
-    }
+    s.as_str()
 }
 
 pub fn run(config: &Path, json: bool, limit: u32) -> ExitCode {

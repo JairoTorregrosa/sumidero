@@ -29,22 +29,26 @@
 //! whenever the estimated total exceeds the budget, LRU entries are
 //! evicted.
 //!
-//! # TTL semantics
+//! # TTL semantics (RFC 1035, RFC 2308, RFC 8767)
 //!
-//! On insert the **effective TTL** (how long the entry stays fresh) is
-//! `max(min(record.ttl for each record in answer+authority), MIN_TTL_SECS)`.
-//! An empty record set uses `MIN_TTL_SECS`.
+//! An entry is **fresh** for exactly its authoritative lifetime: the
+//! smallest TTL among its answer and authority records, where an SOA in
+//! a negative answer counts as `min(SOA TTL, SOA MINIMUM)` (RFC 2308
+//! §5). Nothing is raised to a floor: a 30 s CDN answer is fresh for
+//! 30 s.
 //!
-//! On `get`:
-//! - **Fresh** (`elapsed < effective_ttl`): returns a clone with each record's
-//!   TTL set to `max(original_record_ttl − elapsed, 1)`. Note: per-record TTLs
-//!   are *not* clamped to `MIN_TTL_SECS`; a record whose original TTL was 10
-//!   will show TTL 1 after 10 s even though the entry remains fresh for 300 s.
-//! - **Stale** (`effective_ttl ≤ elapsed < effective_ttl + STALE_WINDOW_SECS`):
-//!   returns a clone with all record TTLs set to `STALE_TTL_SECS` (30 s), a
-//!   short fixed value that tells downstream resolvers to re-query soon.
-//! - **Miss** (`elapsed ≥ effective_ttl + STALE_WINDOW_SECS`): the entry is
-//!   lazily removed and `Miss` is returned.
+//! - **Fresh** (`elapsed < lifetime`): each record's TTL is its original
+//!   minus `elapsed` (at least 1).
+//! - **Stale** (`lifetime ≤ elapsed < lifetime + serve_stale`): served
+//!   with every TTL set to [`STALE_ANSWER_TTL_SECS`] (RFC 8767 §4 asks
+//!   for 30 s) while the pipeline refreshes it in the background. The
+//!   stale window is the operator's `[cache] serve_stale_secs` (default
+//!   [`DEFAULT_SERVE_STALE_SECS`], 12 h, the `AdGuard` Home optimistic
+//!   cache default; 0 disables serving stale).
+//! - **Miss** afterwards: the entry is removed lazily.
+//!
+//! A negative answer without an SOA has no lifetime (RFC 2308 §5) and
+//! is not cached.
 //!
 //! # `len()` semantics
 //!
@@ -64,18 +68,17 @@ use std::time::Instant;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
 
-/// Minimum effective TTL in seconds. Even if every record has a lower TTL, the
-/// entry stays fresh for at least this long.
-pub const MIN_TTL_SECS: u64 = 300;
+/// Default for how long past its lifetime an entry stays servable as
+/// stale (12 h). Measured on the household's own 14.5 h query trace:
+/// 30 min of stale left 14.4% of repeat queries as upstream misses,
+/// 3 h 3.9%, 12 h 0.5%.
+pub const DEFAULT_SERVE_STALE_SECS: u64 = 12 * 3600;
 
-/// How long past the effective TTL a stale entry remains servable (seconds).
-/// 30 minutes gives the upstream time to recover from a brief outage while
-/// keeping the stale window bounded.
-pub const STALE_WINDOW_SECS: u64 = 1800;
+/// Upper bound for `serve_stale_secs` (RFC 8767 §5 suggests 1 to 3 days).
+pub const MAX_SERVE_STALE_SECS: u64 = 3 * 86_400;
 
-/// TTL set on every record in a stale response (seconds). A short value
-/// signals to downstream caches/resolvers that they should re-query soon.
-const STALE_TTL_SECS: u32 = 30;
+/// TTL on every record of a stale answer (RFC 8767 §4: 30 s).
+pub const STALE_ANSWER_TTL_SECS: u32 = 30;
 
 /// Default budget for the estimated in-memory size of all cached
 /// entries. Sized against the ~270 MB of `MemoryMax` headroom measured
@@ -121,6 +124,12 @@ impl CacheKey {
     pub fn new(name: Name, rtype: RecordType, class: DNSClass) -> Self {
         Self { name, rtype, class }
     }
+
+    /// The query name.
+    #[must_use]
+    pub fn name(&self) -> &Name {
+        &self.name
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -132,8 +141,8 @@ impl CacheKey {
 pub enum Lookup {
     /// Entry is within its effective TTL. Record TTLs are decremented.
     Fresh(Message),
-    /// Entry is past its effective TTL but within the stale window.
-    /// Record TTLs are set to a fixed short value ([`STALE_TTL_SECS`]).
+    /// Entry is past its lifetime but within the stale window. Record
+    /// TTLs are [`STALE_ANSWER_TTL_SECS`].
     Stale(Message),
     /// No usable entry (never stored, or past the stale window and removed).
     Miss,
@@ -159,7 +168,7 @@ struct Entry {
     authorities: Vec<OriginalRecord>,
     /// Metadata from the original message.
     response_code: ResponseCode,
-    /// The effective TTL (already clamped to ≥ `MIN_TTL_SECS`).
+    /// Authoritative lifetime: smallest TTL (SOA: `min(ttl, minimum)`).
     effective_ttl_secs: u64,
     /// Instant at which this entry was inserted (or last replaced).
     inserted_at: Instant,
@@ -200,6 +209,8 @@ struct Inner {
     bytes_total: usize,
     /// Budget for `bytes_total`; exceeding it evicts LRU entries.
     max_bytes: usize,
+    /// Seconds past its lifetime an entry may be served stale.
+    serve_stale_secs: u64,
 }
 
 /// Thread-safe DNS response cache with LRU eviction.
@@ -220,7 +231,7 @@ impl Cache {
     /// purpose and likely indicates a configuration error.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        Self::with_max_bytes(capacity, DEFAULT_MAX_BYTES)
+        Self::with_limits(capacity, DEFAULT_MAX_BYTES, DEFAULT_SERVE_STALE_SECS)
     }
 
     /// Create a cache bounded by `capacity` entries and `max_bytes` of
@@ -231,6 +242,16 @@ impl Cache {
     /// Panics if `capacity` or `max_bytes` is zero.
     #[must_use]
     pub fn with_max_bytes(capacity: usize, max_bytes: usize) -> Self {
+        Self::with_limits(capacity, max_bytes, DEFAULT_SERVE_STALE_SECS)
+    }
+
+    /// Fully specified cache: entry cap, byte budget and stale window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` or `max_bytes` is zero.
+    #[must_use]
+    pub fn with_limits(capacity: usize, max_bytes: usize, serve_stale_secs: u64) -> Self {
         assert!(capacity > 0, "cache capacity must be > 0");
         assert!(max_bytes > 0, "cache byte budget must be > 0");
         Self {
@@ -243,6 +264,7 @@ impl Cache {
                 capacity,
                 bytes_total: 0,
                 max_bytes,
+                serve_stale_secs,
             }),
         }
     }
@@ -282,15 +304,21 @@ impl Cache {
             })
             .collect();
 
-        // effective_ttl = max(min TTL across all records, MIN_TTL_SECS).
-        let min_record_ttl = answers
+        // Lifetime = smallest TTL; an SOA counts as min(TTL, MINIMUM)
+        // (RFC 2308 §5). No floor: freshness never outlives the data.
+        let Some(effective_ttl_secs) = answers
             .iter()
             .chain(authorities.iter())
-            .map(|r| u64::from(r.original_ttl))
+            .map(|r| match &r.record.data {
+                hickory_proto::rr::RData::SOA(soa) => u64::from(r.original_ttl.min(soa.minimum)),
+                _ => u64::from(r.original_ttl),
+            })
             .min()
-            .unwrap_or(MIN_TTL_SECS);
-
-        let effective_ttl_secs = min_record_ttl.max(MIN_TTL_SECS);
+        else {
+            // No records at all: a negative answer without an SOA has no
+            // lifetime (RFC 2308 §5); an empty NOERROR is the same case.
+            return;
+        };
 
         let entry = Arc::new(Entry {
             answers,
@@ -359,6 +387,7 @@ impl Cache {
             return Lookup::Miss;
         };
 
+        let serve_stale_secs = inner.serve_stale_secs;
         let (effective_ttl_secs, inserted_at) = {
             let Slot::Occupied(node) = &inner.slots[idx] else {
                 return Lookup::Miss;
@@ -369,7 +398,7 @@ impl Cache {
         let elapsed = now.duration_since(inserted_at);
         let elapsed_secs = elapsed.as_secs();
 
-        if elapsed_secs >= effective_ttl_secs + STALE_WINDOW_SECS {
+        if elapsed_secs >= effective_ttl_secs.saturating_add(serve_stale_secs) {
             // Past stale window — remove lazily.
             inner.remove(idx);
             return Lookup::Miss;
@@ -396,7 +425,7 @@ impl Cache {
             Lookup::Fresh(msg)
         } else {
             // Stale: fixed short TTL.
-            let msg = build_response(&entry, |_| STALE_TTL_SECS);
+            let msg = build_response(&entry, |_| STALE_ANSWER_TTL_SECS);
             Lookup::Stale(msg)
         }
     }
@@ -656,36 +685,74 @@ mod tests {
     }
 
     #[test]
-    fn fresh_hit_decremented_ttl_floors_at_1() {
+    fn record_ttls_decrement_and_the_entry_expires_with_its_shortest_record() {
         let cache = Cache::new(16);
         let now = Instant::now();
         let k = key("example.com.");
-        // Record TTL 10, but effective_ttl = MIN_TTL_SECS = 300.
-        // At elapsed = 50, the record's own TTL is 10 - 50 < 0 → floor at 1.
-        cache.insert(k.clone(), &noerror_a("example.com.", 10), now);
+        cache.insert(
+            k.clone(),
+            &noerror_two_records("example.com.", 10, 100),
+            now,
+        );
 
-        let later = now + Duration::from_secs(50);
-        let Lookup::Fresh(msg) = cache.get(&k, later) else {
-            panic!("expected Fresh — entry should be fresh for MIN_TTL_SECS");
+        let Lookup::Fresh(msg) = cache.get(&k, now + Duration::from_secs(9)) else {
+            panic!("fresh until the shortest TTL runs out");
         };
-        assert_eq!(msg.answers[0].ttl, 1);
+        assert_eq!((msg.answers[0].ttl, msg.answers[1].ttl), (1, 91));
+        assert!(matches!(
+            cache.get(&k, now + Duration::from_secs(10)),
+            Lookup::Stale(_)
+        ));
     }
 
     /// Entry with low record TTL stays fresh for `MIN_TTL_SECS`.
     #[test]
-    fn min_ttl_clamp_raises_effective_ttl() {
+    fn short_ttl_is_never_raised_to_a_floor() {
+        // A 30 s CDN answer is fresh for 30 s, not 300: freshness must
+        // never outlive what the authority published.
         let cache = Cache::new(16);
         let now = Instant::now();
-        let k = key("example.com.");
-        cache.insert(k.clone(), &noerror_a("example.com.", 10), now);
+        let k = key("cdn.example.com.");
+        cache.insert(k.clone(), &noerror_a("cdn.example.com.", 30), now);
+        assert!(matches!(
+            cache.get(&k, now + Duration::from_secs(29)),
+            Lookup::Fresh(_)
+        ));
+        assert!(matches!(
+            cache.get(&k, now + Duration::from_secs(30)),
+            Lookup::Stale(_)
+        ));
+    }
 
-        // At elapsed = 299 it should still be Fresh.
-        let at_299 = now + Duration::from_secs(MIN_TTL_SECS - 1);
-        assert!(matches!(cache.get(&k, at_299), Lookup::Fresh(_)));
+    #[test]
+    fn zero_ttl_answer_is_only_ever_served_stale() {
+        let cache = Cache::new(16);
+        let now = Instant::now();
+        let k = key("zero.example.com.");
+        cache.insert(k.clone(), &noerror_a("zero.example.com.", 0), now);
+        assert!(matches!(cache.get(&k, now), Lookup::Stale(_)));
+    }
 
-        // At elapsed = MIN_TTL_SECS it transitions to Stale.
-        let at_min = now + Duration::from_secs(MIN_TTL_SECS);
-        assert!(matches!(cache.get(&k, at_min), Lookup::Stale(_)));
+    #[test]
+    fn negative_answer_lives_min_of_soa_ttl_and_minimum() {
+        let cache = Cache::new(16);
+        let now = Instant::now();
+        let k = key("nx.example.com.");
+        let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
+        msg.metadata.response_code = ResponseCode::NXDomain;
+        let zone = Name::from_ascii("example.com.").unwrap();
+        let soa =
+            hickory_proto::rr::rdata::SOA::new(zone.clone(), zone.clone(), 1, 3600, 600, 86400, 60);
+        msg.add_authority(Record::from_rdata(zone, 3600, RData::SOA(soa)));
+        cache.insert(k.clone(), &msg, now);
+        assert!(matches!(
+            cache.get(&k, now + Duration::from_secs(59)),
+            Lookup::Fresh(_)
+        ));
+        assert!(matches!(
+            cache.get(&k, now + Duration::from_secs(60)),
+            Lookup::Stale(_)
+        ));
     }
 
     /// Effective TTL is the minimum across all answer+authority records.
@@ -744,7 +811,7 @@ mod tests {
         let Lookup::Stale(msg) = cache.get(&k, at_ttl) else {
             panic!("expected Stale at exactly effective_ttl");
         };
-        assert_eq!(msg.answers[0].ttl, STALE_TTL_SECS);
+        assert_eq!(msg.answers[0].ttl, STALE_ANSWER_TTL_SECS);
     }
 
     #[test]
@@ -754,8 +821,8 @@ mod tests {
         let k = key("example.com.");
         cache.insert(k.clone(), &noerror_a("example.com.", 3600), now);
 
-        // elapsed = effective_ttl + STALE_WINDOW_SECS - 1 → still Stale
-        let at_end = now + Duration::from_secs(3600 + STALE_WINDOW_SECS - 1);
+        // elapsed = lifetime + serve_stale - 1 → still Stale
+        let at_end = now + Duration::from_secs(3600 + DEFAULT_SERVE_STALE_SECS - 1);
         assert!(matches!(cache.get(&k, at_end), Lookup::Stale(_)));
     }
 
@@ -766,10 +833,22 @@ mod tests {
         let k = key("example.com.");
         cache.insert(k.clone(), &noerror_a("example.com.", 3600), now);
 
-        // elapsed = effective_ttl + STALE_WINDOW_SECS → Miss, entry removed
-        let past = now + Duration::from_secs(3600 + STALE_WINDOW_SECS);
+        // elapsed = lifetime + serve_stale → Miss, entry removed
+        let past = now + Duration::from_secs(3600 + DEFAULT_SERVE_STALE_SECS);
         assert!(matches!(cache.get(&k, past), Lookup::Miss));
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn serve_stale_zero_turns_expiry_into_a_miss() {
+        let cache = Cache::with_limits(16, DEFAULT_MAX_BYTES, 0);
+        let now = Instant::now();
+        let k = key("example.com.");
+        cache.insert(k.clone(), &noerror_a("example.com.", 60), now);
+        assert!(matches!(
+            cache.get(&k, now + Duration::from_secs(60)),
+            Lookup::Miss
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -927,22 +1006,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn empty_record_set_uses_min_ttl() {
+    fn answer_without_records_or_soa_is_not_cached() {
         let cache = Cache::new(16);
         let now = Instant::now();
-
         let k = key("empty.example.com.");
         let mut msg = Message::new(0, MessageType::Response, OpCode::Query);
-        msg.metadata.response_code = ResponseCode::NoError;
-        // No answers, no authorities.
+        msg.metadata.response_code = ResponseCode::NXDomain;
         cache.insert(k.clone(), &msg, now);
-
-        // Should be fresh for MIN_TTL_SECS.
-        let at = now + Duration::from_secs(MIN_TTL_SECS - 1);
-        assert!(matches!(cache.get(&k, at), Lookup::Fresh(_)));
-
-        let at_min = now + Duration::from_secs(MIN_TTL_SECS);
-        assert!(matches!(cache.get(&k, at_min), Lookup::Stale(_)));
+        assert!(matches!(cache.get(&k, now), Lookup::Miss));
     }
 
     // -----------------------------------------------------------------------
@@ -1110,7 +1181,7 @@ mod tests {
         let k = key("nx.example.com.");
         cache.insert(k.clone(), &nxdomain("nx.example.com.", 300), now);
 
-        let stale_time = now + Duration::from_secs(MIN_TTL_SECS);
+        let stale_time = now + Duration::from_secs(300);
         let Lookup::Stale(msg) = cache.get(&k, stale_time) else {
             panic!("expected Stale");
         };

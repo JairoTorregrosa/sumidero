@@ -743,3 +743,132 @@ async fn admission_cap_sheds_excess_load_with_servfail() {
         pipeline.in_flight()
     );
 }
+
+// ---------------------------------------------------------------------------
+// TTL fidelity and the resolution-failure cache (RFC 2308, 8767, 9520)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn short_ttl_answer_goes_stale_on_time_and_is_refreshed_in_the_background() {
+    let f = fixture("").await;
+    f.up.set_ttl(30);
+    let q = query("cdn.test.", RecordType::A);
+    let t0 = Instant::now();
+    let first = f.pipeline.handle_at(&q, CLIENT, t0).await;
+    assert_eq!(first.answers[0].ttl, 30);
+
+    let fresh = f
+        .pipeline
+        .handle_at(&q, CLIENT, t0 + Duration::from_secs(20))
+        .await;
+    assert_eq!(fresh.answers[0].ttl, 10, "fresh hits count the TTL down");
+    assert_eq!(f.up.asked("cdn.test"), 1);
+
+    // Past the published TTL: served at once with TTL 30, refreshed behind.
+    let stale = f
+        .pipeline
+        .handle_at(&q, CLIENT, t0 + Duration::from_secs(31))
+        .await;
+    assert_eq!(stale.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        stale.answers[0].ttl,
+        sumidero_core::cache::STALE_ANSWER_TTL_SECS
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(f.up.asked("cdn.test"), 2, "one background refresh");
+}
+
+#[tokio::test]
+async fn broken_name_is_asked_once_per_hold_not_once_per_query() {
+    let f = fixture("").await;
+    f.up.set_mode(Mode::ServFail);
+    let q = query("broken.test.", RecordType::A);
+    let t0 = Instant::now();
+    let first = f.pipeline.handle_at(&q, CLIENT, t0).await;
+    assert_eq!(first.metadata.response_code, ResponseCode::ServFail);
+    for s in [1, 2, 4] {
+        let r = f
+            .pipeline
+            .handle_at(&q, CLIENT, t0 + Duration::from_secs(s))
+            .await;
+        assert_eq!(r.metadata.response_code, ResponseCode::ServFail);
+    }
+    assert_eq!(
+        f.up.asked("broken.test"),
+        1,
+        "held for 5 s after the first failure"
+    );
+
+    // The hold ends; the next failure doubles it to 10 s.
+    let t1 = t0 + Duration::from_secs(5);
+    f.pipeline.handle_at(&q, CLIENT, t1).await;
+    assert_eq!(f.up.asked("broken.test"), 2);
+    f.pipeline
+        .handle_at(&q, CLIENT, t1 + Duration::from_secs(9))
+        .await;
+    assert_eq!(f.up.asked("broken.test"), 2);
+
+    // Other types of the same name are not held.
+    f.pipeline
+        .handle_at(&query("broken.test.", RecordType::AAAA), CLIENT, t1)
+        .await;
+    assert_eq!(f.up.asked("broken.test"), 3);
+
+    f.db.flush();
+    let rows = f.db.recent_queries(10).unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.source == sumidero_core::db::ResponseSource::FailureCached)
+            .count(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn upstream_outage_answers_repeats_instantly_instead_of_timing_out_again() {
+    let f = down("").await;
+    let q = query("anything.test.", RecordType::A);
+    let t0 = Instant::now();
+    let started = Instant::now();
+    assert_eq!(
+        f.pipeline
+            .handle_at(&q, CLIENT, t0)
+            .await
+            .metadata
+            .response_code,
+        ResponseCode::ServFail
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "the first one waits for the timeout"
+    );
+    let started = Instant::now();
+    let r = f
+        .pipeline
+        .handle_at(&q, CLIENT, t0 + Duration::from_secs(1))
+        .await;
+    assert_eq!(r.metadata.response_code, ResponseCode::ServFail);
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "the repeat is answered from the hold"
+    );
+}
+
+#[tokio::test]
+async fn stale_answer_beats_a_failure_hold() {
+    let f = fixture_with("", SafeSearch::new::<&str>(false, &[]).unwrap(), 300).await;
+    f.up.set_ttl(60);
+    let q = query("known.test.", RecordType::A);
+    let t0 = Instant::now();
+    f.pipeline.handle_at(&q, CLIENT, t0).await;
+
+    f.up.set_mode(Mode::Hang);
+    for s in [61, 62, 3600] {
+        let r = f
+            .pipeline
+            .handle_at(&q, CLIENT, t0 + Duration::from_secs(s))
+            .await;
+        assert_eq!(r.metadata.response_code, ResponseCode::NoError, "+{s}s");
+        assert_ne!(r.answers.len(), 0, "+{s}s");
+    }
+}
