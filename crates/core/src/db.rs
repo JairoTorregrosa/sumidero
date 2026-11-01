@@ -44,14 +44,18 @@ pub enum VerdictKind {
     Allowed,
     Blocked,
     Excepted,
+    /// Answered with a safe-search CNAME instead of the real records.
+    Rewritten,
 }
 
 impl VerdictKind {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Allowed => "allowed",
             Self::Blocked => "blocked",
             Self::Excepted => "excepted",
+            Self::Rewritten => "rewritten",
         }
     }
 
@@ -60,6 +64,7 @@ impl VerdictKind {
             "allowed" => Ok(Self::Allowed),
             "blocked" => Ok(Self::Blocked),
             "excepted" => Ok(Self::Excepted),
+            "rewritten" => Ok(Self::Rewritten),
             other => Err(DbError::Sql(rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Text,
@@ -230,7 +235,11 @@ pub struct Stats {
     pub total: u64,
     pub blocked: u64,
     pub excepted: u64,
+    /// Answered with a safe-search CNAME.
+    pub rewritten: u64,
     pub cache_hits: u64,
+    /// Expired entries served while a refresh ran (also answered locally).
+    pub stale_hits: u64,
     pub upstream_failures: u64,
     /// (qname, count), most-queried first.
     pub top_queried: Vec<(String, u64)>,
@@ -266,9 +275,10 @@ impl std::fmt::Debug for Db {
 
 /// On-disk schema version.
 ///
-/// v2 added `daemon_stats.log_events_dropped_recent`; see
+/// v2 added `daemon_stats.log_events_dropped_recent`; v3 added the
+/// `rewritten` verdict; see
 /// [`migrate_schema`].
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Schema helpers
@@ -297,7 +307,7 @@ fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             client TEXT NOT NULL,
             qname TEXT NOT NULL,
             qtype INTEGER NOT NULL,
-            verdict TEXT NOT NULL CHECK(verdict IN ('allowed','blocked','excepted')),
+            verdict TEXT NOT NULL CHECK(verdict IN ('allowed','blocked','excepted','rewritten')),
             rule TEXT,
             list INTEGER,
             source TEXT NOT NULL,
@@ -356,6 +366,40 @@ fn migrate_schema(conn: &Connection, from: u32) -> Result<(), DbError> {
                 "ALTER TABLE daemon_stats \
                  ADD COLUMN log_events_dropped_recent INTEGER NOT NULL DEFAULT 0",
                 [],
+            )?;
+        }
+    }
+    if from < 3 {
+        // v2 -> v3: the `rewritten` verdict (safe-search answers were
+        // logged as plain `allowed`, so enforcement could not be audited).
+        // SQLite cannot alter a CHECK constraint: rebuild the table in one
+        // transaction, keeping every row and id.
+        let sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'queries'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !sql.contains("'rewritten'") {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE queries RENAME TO queries_v2;
+                 CREATE TABLE queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    client TEXT NOT NULL,
+                    qname TEXT NOT NULL,
+                    qtype INTEGER NOT NULL,
+                    verdict TEXT NOT NULL CHECK(verdict IN ('allowed','blocked','excepted','rewritten')),
+                    rule TEXT,
+                    list INTEGER,
+                    source TEXT NOT NULL,
+                    rcode INTEGER NOT NULL,
+                    duration_us INTEGER NOT NULL
+                 );
+                 INSERT INTO queries SELECT * FROM queries_v2;
+                 DROP TABLE queries_v2;
+                 CREATE INDEX IF NOT EXISTS idx_queries_ts ON queries(ts);
+                 COMMIT;",
             )?;
         }
     }
@@ -763,18 +807,25 @@ impl Db {
     pub fn stats(&self, since_ts: i64) -> Result<Stats, DbError> {
         let conn = open_read_conn(&self.path)?;
 
-        let count = |sql: &str| -> Result<u64, DbError> {
-            let n: i64 = conn.query_row(sql, params![since_ts], |row| row.get(0))?;
-            Ok(u64::try_from(n).unwrap_or(0))
-        };
-
-        let total = count("SELECT COUNT(*) FROM queries WHERE ts >= ?1")?;
-        let blocked = count("SELECT COUNT(*) FROM queries WHERE ts >= ?1 AND verdict = 'blocked'")?;
-        let excepted =
-            count("SELECT COUNT(*) FROM queries WHERE ts >= ?1 AND verdict = 'excepted'")?;
-        let cache_hits = count("SELECT COUNT(*) FROM queries WHERE ts >= ?1 AND source = 'cache'")?;
-        let upstream_failures =
-            count("SELECT COUNT(*) FROM queries WHERE ts >= ?1 AND source = 'failed'")?;
+        // One scan for every counter (the log holds 7 days of queries).
+        let (total, blocked, excepted, rewritten, cache_hits, stale_hits, upstream_failures) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(verdict = 'blocked'), 0),
+                        COALESCE(SUM(verdict = 'excepted'), 0),
+                        COALESCE(SUM(verdict = 'rewritten'), 0),
+                        COALESCE(SUM(source = 'cache'), 0),
+                        COALESCE(SUM(source = 'stale'), 0),
+                        COALESCE(SUM(source = 'failed'), 0)
+                 FROM queries WHERE ts >= ?1",
+                params![since_ts],
+                |r| {
+                    let n = |i: usize| -> rusqlite::Result<u64> {
+                        Ok(u64::try_from(r.get::<_, i64>(i)?).unwrap_or(0))
+                    };
+                    Ok((n(0)?, n(1)?, n(2)?, n(3)?, n(4)?, n(5)?, n(6)?))
+                },
+            )?;
 
         let top_list = |sql: &str| -> Result<Vec<(String, u64)>, DbError> {
             let mut stmt = conn.prepare(sql)?;
@@ -801,7 +852,9 @@ impl Db {
             total,
             blocked,
             excepted,
+            rewritten,
             cache_hits,
+            stale_hits,
             upstream_failures,
             top_queried,
             top_blocked,
@@ -984,6 +1037,53 @@ mod tests {
             }
             other => panic!("expected SchemaTooNew, got: {other}"),
         }
+    }
+
+    /// The production database on the jetson is v2: its `queries` CHECK
+    /// rejects `rewritten`. Opening it must keep every logged query and
+    /// then accept safe-search rows.
+    #[test]
+    fn production_v2_log_keeps_its_rows_and_accepts_rewrites() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sumidero.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_connection(&conn).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE queries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL, client TEXT NOT NULL, qname TEXT NOT NULL,
+                    qtype INTEGER NOT NULL,
+                    verdict TEXT NOT NULL CHECK(verdict IN ('allowed','blocked','excepted')),
+                    rule TEXT, list INTEGER, source TEXT NOT NULL,
+                    rcode INTEGER NOT NULL, duration_us INTEGER NOT NULL);
+                 INSERT INTO queries (ts, client, qname, qtype, verdict, rule, list, source, rcode, duration_us)
+                    VALUES (1700000000, '192.168.0.116', 'pornhub.com', 1, 'blocked', '||pornhub.com^', 3, 'synth', 3, 40);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '2');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let rewrite = QueryRecord {
+            ts: 1_700_000_100,
+            client: "192.168.0.116".parse().unwrap(),
+            qname: "www.google.com.co".into(),
+            qtype: 1,
+            verdict: VerdictKind::Rewritten,
+            rule: Some("safe-search -> forcesafesearch.google.com".into()),
+            list: None,
+            source: ResponseSource::Synth,
+            rcode: 0,
+            duration_us: 900,
+        };
+        assert!(db.writer().log(LogEvent::Query(rewrite.clone())));
+        db.flush();
+        let rows = db.recent_queries(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], rewrite);
+        assert_eq!(rows[1].qname, "pornhub.com");
+        assert_eq!(rows[1].verdict, VerdictKind::Blocked);
     }
 
     #[test]

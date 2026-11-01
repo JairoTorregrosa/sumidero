@@ -503,7 +503,7 @@ async fn safesearch_youtube_and_aaaa() {
         builder.build(),
         vec!["l".into()],
         Cache::new(16),
-        SafeSearch::new(true, &[]).unwrap(),
+        SafeSearch::new::<&str>(true, &[]).unwrap(),
         MockUpstream::ok(),
         db.writer(),
         vec!["192.168.0.0/16".parse::<IpNet>().unwrap()],
@@ -533,7 +533,7 @@ async fn policy_swap_applies_new_allowlist_and_safesearch() {
         .await;
     assert_eq!(r.metadata.response_code, ResponseCode::Refused);
     f.pipeline.swap_policy(
-        SafeSearch::new(false, &[]).unwrap(),
+        SafeSearch::new::<&str>(false, &[]).unwrap(),
         vec!["8.8.8.0/24".parse::<IpNet>().unwrap()],
     );
     // Now OUTSIDER is allowed and www.google.com is no longer rewritten.
@@ -718,7 +718,7 @@ async fn shadow_records_expected_and_real_divergences() {
         builder.build(),
         vec!["l".into()],
         Cache::new(16),
-        SafeSearch::new(false, &[]).unwrap(),
+        SafeSearch::new::<&str>(false, &[]).unwrap(),
         MockUpstream::ok(),
         db.writer(),
         vec!["192.168.0.0/16".parse::<IpNet>().unwrap()],

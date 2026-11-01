@@ -10,11 +10,7 @@ use super::{load_config, open_db};
 use crate::output::{emit, fail};
 
 pub(crate) fn verdict_str(v: VerdictKind) -> &'static str {
-    match v {
-        VerdictKind::Allowed => "allowed",
-        VerdictKind::Blocked => "blocked",
-        VerdictKind::Excepted => "excepted",
-    }
+    v.as_str()
 }
 
 pub(crate) fn source_str(s: ResponseSource) -> &'static str {

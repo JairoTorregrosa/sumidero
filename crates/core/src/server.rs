@@ -371,6 +371,8 @@ impl<U: Upstream> Pipeline<U> {
         // Safe-search rewrite.
         let safesearch = self.safesearch.load();
         if let Some(target) = safesearch.rewrite(&qname) {
+            log.verdict = VerdictKind::Rewritten;
+            log.rule = Some(format!("safe-search -> {target}"));
             let resp = self
                 .answer_safesearch(request, &qname, qtype, target, now)
                 .await;
@@ -921,13 +923,7 @@ pub async fn run(
     let db = crate::db::Db::open(&config.database.path)?;
     let started_ts = unix_now();
 
-    let providers: Vec<&str> = config
-        .safe_search
-        .providers
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let safesearch = SafeSearch::new(config.safe_search.enabled, &providers)?;
+    let safesearch = SafeSearch::new(config.safe_search.enabled, &config.safe_search.providers)?;
 
     let pool = crate::upstream::UpstreamPool::new(&crate::upstream::UpstreamConfig {
         urls: config.upstreams.servers.clone(),
@@ -984,13 +980,10 @@ pub async fn run(
                     Ok(new_config) => {
                         match reload_lists(&new_config, &pipeline, &db, started_ts, false).await {
                             Ok(hash) => {
-                                let providers: Vec<&str> = new_config
-                                    .safe_search
-                                    .providers
-                                    .iter()
-                                    .map(String::as_str)
-                                    .collect();
-                                match SafeSearch::new(new_config.safe_search.enabled, &providers) {
+                                match SafeSearch::new(
+                                    new_config.safe_search.enabled,
+                                    &new_config.safe_search.providers,
+                                ) {
                                     Ok(ss) => pipeline
                                         .swap_policy(ss, new_config.server.allow.clone()),
                                     Err(err) => tracing::error!(

@@ -68,7 +68,7 @@ async fn start_on(binds: &[std::net::SocketAddr]) -> Env {
         builder.build(),
         vec!["e2e".to_string()],
         Cache::new(64),
-        SafeSearch::new(false, &[]).unwrap(),
+        SafeSearch::new::<&str>(false, &[]).unwrap(),
         MockUpstream {
             calls: Arc::new(AtomicUsize::new(0)),
         },
@@ -97,7 +97,7 @@ async fn start() -> Env {
         builder.build(),
         vec!["e2e".to_string()],
         Cache::new(64),
-        SafeSearch::new(false, &[]).unwrap(),
+        SafeSearch::new::<&str>(false, &[]).unwrap(),
         MockUpstream {
             calls: Arc::new(AtomicUsize::new(0)),
         },
@@ -220,7 +220,7 @@ async fn udp_oversized_answer_gets_truncated() {
         builder.build(),
         vec!["e2e".into()],
         Cache::new(16),
-        SafeSearch::new(false, &[]).unwrap(),
+        SafeSearch::new::<&str>(false, &[]).unwrap(),
         BigAnswerUpstream,
         db.writer(),
         vec!["127.0.0.0/8".parse::<IpNet>().unwrap()],
@@ -314,7 +314,7 @@ async fn a_genuinely_taken_port_still_fails_loudly_and_names_itself() {
         EngineBuilder::new().build(),
         vec![],
         Cache::new(8),
-        SafeSearch::new(false, &[]).unwrap(),
+        SafeSearch::new::<&str>(false, &[]).unwrap(),
         MockUpstream {
             calls: Arc::new(AtomicUsize::new(0)),
         },
