@@ -108,15 +108,34 @@ trait Transport: Send + Sync + 'static {
 /// non-exhaustive, so anything unrecognized is treated as fatal: a
 /// spurious rebuild costs one handshake, a spurious reuse of a dead
 /// connection costs every query until the process restarts.
+///
+/// A 4xx HTTP status is a complete response on a working stream: the
+/// server refused this one request (Quad9 answers `403 DoH dropped
+/// query` when it sheds load). Tearing the connection down for it, as
+/// for a dead one, turns every shed query into a TLS handshake. A 5xx
+/// stays fatal: a proxy pinned to a broken backend keeps failing on the
+/// same connection, and a new one may reach a healthy backend.
+/// hickory reports the status only as a message (its own TODO is an
+/// explicit error type), so the message is matched.
 fn classify_net_error(err: &hickory_resolver::net::NetError) -> SendError {
     use hickory_resolver::net::NetError;
     match err {
         NetError::Dns(_) | NetError::Proto(_) | NetError::QueryCaseMismatch => {
             SendError::Query(err.to_string())
         }
+        NetError::Msg(msg)
+            if msg
+                .strip_prefix(HTTP_STATUS_ERROR_PREFIX)
+                .is_some_and(|status| status.starts_with('4')) =>
+        {
+            SendError::Query(err.to_string())
+        }
         _ => SendError::Fatal(err.to_string()),
     }
 }
+
+/// How hickory's `DoH` (h2) and `DoH3` clients word a non-2xx status.
+const HTTP_STATUS_ERROR_PREFIX: &str = "http unsuccessful code: ";
 
 /// Wraps a cloneable `DnsExchange` for `DoH` or `DoQ`.
 ///
@@ -1057,6 +1076,28 @@ use hickory_resolver::net::runtime::Spawn;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_http_status_refusal_fails_the_query_not_the_connection() {
+        use hickory_resolver::net::NetError;
+        // The exact error hickory-net builds for Quad9's load shedding.
+        let shed = NetError::from(format!(
+            "http unsuccessful code: {}, message: {}",
+            "403 Forbidden", "DoH dropped query"
+        ));
+        assert!(matches!(classify_net_error(&shed), SendError::Query(_)));
+        // A server error may be this connection's backend: rebuild.
+        let broken = NetError::from(format!(
+            "http unsuccessful code: {}, message: {}",
+            "502 Bad Gateway", ""
+        ));
+        assert!(matches!(classify_net_error(&broken), SendError::Fatal(_)));
+        // A dead exchange still condemns the connection.
+        assert!(matches!(
+            classify_net_error(&NetError::Busy),
+            SendError::Fatal(_)
+        ));
+    }
 
     // ── URL validation tests ────────────────────────────────────────
 
