@@ -55,14 +55,20 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
 # --- resources ------------------------------------------------------
-# Sized from the measured SIGHUP reload peak — 429 MB RSS / 491 MB
-# cgroup at 3.29M rules, when the old and new engines coexist — plus
-# margin for a refresh that re-downloads the lists. See PERF.md; do not
-# lower this without re-measuring a reload on the real rule set.
+# Sized from the measured SIGHUP reload peak (317 MB RSS at 3.0M rules
+# with the malloc settings below, 432 MB without) plus margin for a
+# refresh that re-downloads the lists. See docs/PERF.md; do not lower
+# this without re-measuring a reload on the real rule set.
 MemoryMax=768M
 # glibc gives each thread its own arena; two is plenty for this
 # workload and keeps RSS predictable.
 Environment=MALLOC_ARENA_MAX=2
+# Allocations of 1 MiB and up get their own mappings, returned to the
+# kernel when freed. Without a fixed threshold glibc raises it after the
+# first large free, so every reload leaves the previous engine's memory
+# in the heap: RSS 117 MB after two reloads with this, 275-301 MB
+# without (measured on the jetson, 3.0M rules). CPU per query unchanged.
+Environment=MALLOC_MMAP_THRESHOLD_=1048576
 Environment=RUST_LOG=info
 
 [Install]
