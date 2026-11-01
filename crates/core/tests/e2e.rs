@@ -84,7 +84,7 @@ async fn udp_end_to_end_blocked_and_allowed() {
 
     let blocked = query_udp(addr, "blocked.test", RecordType::A).await;
     assert_eq!(blocked.rcode, ResponseCode::NXDomain);
-    assert!(blocked.records.is_empty());
+    assert_eq!(blocked.records.len(), 0, "{:?}", blocked.records);
 
     let allowed = query_udp(addr, "allowed.test", RecordType::A).await;
     assert_eq!(allowed.rcode, ResponseCode::NoError);
