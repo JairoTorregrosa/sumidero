@@ -319,36 +319,20 @@ impl<U: Upstream> Pipeline<U> {
         let Some(query) = request.queries.first() else {
             let mut resp = response_skeleton(request);
             resp.metadata.response_code = ResponseCode::FormErr;
-            let mut log = QueryRecord {
-                ts,
-                client,
-                qname: String::new(),
-                qtype: 0,
-                verdict: VerdictKind::Allowed,
-                rule: None,
-                list: None,
-                source: ResponseSource::Synth,
-                rcode: 0,
-                duration_us: 0,
-            };
+            let mut log = new_log(ts, client, String::new(), 0, ResponseSource::Synth);
             self.finish(&mut log, &resp, started);
             return resp;
         };
         let qname = normalize_qname(&query.name.to_ascii());
         let qtype = query.query_type;
 
-        let mut log = QueryRecord {
+        let mut log = new_log(
             ts,
             client,
-            qname: qname.clone(),
-            qtype: qtype.into(),
-            verdict: VerdictKind::Allowed,
-            rule: None,
-            list: None,
-            source: ResponseSource::Synth,
-            rcode: 0,
-            duration_us: 0,
-        };
+            qname.clone(),
+            qtype.into(),
+            ResponseSource::Synth,
+        );
 
         if !client_allowed(&self.allow.load(), client) {
             let resp = synth_refused(request);
@@ -362,7 +346,10 @@ impl<U: Upstream> Pipeline<U> {
         }
 
         // Filter verdict.
-        let state = self.state.load();
+        // One policy snapshot for the whole query: the CNAME check after
+        // the upstream answer must judge with the same engine as the
+        // name itself, even if a reload lands in between.
+        let state = self.state.load_full();
         match state.engine.verdict(&qname) {
             Verdict::Block { list, rule } => {
                 log.verdict = VerdictKind::Blocked;
@@ -380,7 +367,6 @@ impl<U: Upstream> Pipeline<U> {
             }
             Verdict::NoMatch => {}
         }
-        drop(state);
 
         // Safe-search rewrite.
         let safesearch = self.safesearch.load();
@@ -397,6 +383,22 @@ impl<U: Upstream> Pipeline<U> {
         // Cache → upstream.
         let (resp, source) = self.resolve_cached(request, &qname, qtype, now).await;
         log.source = source;
+
+        // CNAME cloaking: a tracker served under a first-party alias
+        // (`metrics.shop.example CNAME shop.tracker.example`) is blocked
+        // when any name in the chain is. An exception on the queried name
+        // covers its whole chain, the way the operator wrote it.
+        if log.verdict != VerdictKind::Excepted
+            && let Some((target, list, rule)) = blocked_cname_target(&state.engine, &resp)
+        {
+            log.verdict = VerdictKind::Blocked;
+            log.rule = Some(format!("{rule} (CNAME target {target})"));
+            log.list = Some(list);
+            let resp = synth_block_response(request);
+            self.finish(&mut log, &resp, started);
+            self.shadow_tap(request, &resp, true, &qname, qtype);
+            return resp;
+        }
         self.finish(&mut log, &resp, started);
         self.shadow_tap(request, &resp, false, &qname, qtype);
         resp
@@ -411,22 +413,17 @@ impl<U: Upstream> Pipeline<U> {
         started: Instant,
     ) -> Message {
         let resp = synth_servfail(request);
-        let mut log = QueryRecord {
+        let mut log = new_log(
             ts,
             client,
-            qname: request
+            request
                 .queries
                 .first()
                 .map(|q| normalize_qname(&q.name.to_ascii()))
                 .unwrap_or_default(),
-            qtype: request.queries.first().map_or(0, |q| q.query_type.into()),
-            verdict: VerdictKind::Allowed,
-            rule: None,
-            list: None,
-            source: ResponseSource::Failed,
-            rcode: 0,
-            duration_us: 0,
-        };
+            request.queries.first().map_or(0, |q| q.query_type.into()),
+            ResponseSource::Failed,
+        );
         self.finish(&mut log, &resp, started);
         resp
     }
@@ -654,6 +651,47 @@ impl<U: Upstream> Pipeline<U> {
             tracing::warn!("query log queue full; dropped a record");
         }
     }
+}
+
+/// A log record before the verdict: allowed until proven otherwise;
+/// rcode and duration are stamped by `finish`.
+fn new_log(
+    ts: i64,
+    client: IpAddr,
+    qname: String,
+    qtype: u16,
+    source: ResponseSource,
+) -> QueryRecord {
+    QueryRecord {
+        ts,
+        client,
+        qname,
+        qtype,
+        verdict: VerdictKind::Allowed,
+        rule: None,
+        list: None,
+        source,
+        rcode: 0,
+        duration_us: 0,
+    }
+}
+
+/// The first CNAME target in `resp` that the engine blocks, with the
+/// list index and rule text. Targets the engine excepts do not block.
+fn blocked_cname_target(engine: &Engine, resp: &Message) -> Option<(String, usize, String)> {
+    resp.answers.iter().find_map(|record| {
+        let RData::CNAME(target) = &record.data else {
+            return None;
+        };
+        let target = normalize_qname(&target.0.to_ascii());
+        match engine.verdict(&target) {
+            Verdict::Block { list, rule } => {
+                let rule = rule.text.into_owned();
+                Some((target, list, rule))
+            }
+            Verdict::Except { .. } | Verdict::NoMatch => None,
+        }
+    })
 }
 
 /// File an upstream answer: cacheable answers go to the cache and clear
