@@ -161,10 +161,15 @@ field is diagnostic, not a health signal.
 ## Resource limits
 
 `MemoryMax=768M` in the shipped unit is sized from a measured reload
-peak (429 MB RSS / 491 MB cgroup at 3.29M rules, when the old and new
-engines briefly coexist). With a much smaller rule set
-you can lower it; re-measure a SIGHUP reload on your own lists first,
-because the reload peak — not the steady state — is what has to fit.
+peak (317 MB RSS at 3.0M rules, when the old and new engines briefly
+coexist). With a much smaller rule set you can lower it; re-measure a
+SIGHUP reload on your own lists first, because the reload peak — not
+the steady state — is what has to fit.
+
+The unit also sets `MALLOC_MMAP_THRESHOLD_=1048576`. Keep it if you
+write your own unit: without it, glibc keeps each replaced engine's
+memory after a reload, and steady RSS climbs from ~120 MB to ~300 MB
+after the first daily refresh.
 
 ## Uninstall
 
