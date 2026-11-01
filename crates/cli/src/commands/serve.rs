@@ -19,7 +19,7 @@ pub fn run(config: &Path, json: bool, shadow: Option<std::net::SocketAddr>) -> E
         Ok(rt) => rt,
         Err(e) => return fail(json, "serve", &format!("cannot start runtime: {e}"), 1),
     };
-    match runtime.block_on(sumidero_core::server::run(config, shadow)) {
+    match runtime.block_on(sumidero_core::daemon::run(config, shadow)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(json, "serve", &e.to_string(), 1),
     }

@@ -43,7 +43,6 @@ async fn pipeline(up: &DnsUpstream, pki: &Pki, db: &Db, rules: &str) -> Pipeline
     builder.add_list(&parsed.rules);
     Pipeline::new(
         builder.build(),
-        vec!["e2e".to_string()],
         Cache::new(64),
         SafeSearch::new::<&str>(false, &[]).unwrap(),
         pool,

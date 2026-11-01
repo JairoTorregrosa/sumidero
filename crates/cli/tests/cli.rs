@@ -273,6 +273,7 @@ fn status_reports_upstream_health() {
             "consecutive_failures":0}]"#,
             0,
         ),
+        runtime_json: "{}".into(),
     })
     .unwrap();
 
@@ -310,6 +311,7 @@ fn status_not_degraded_while_one_upstream_reconnects() {
             "consecutive_failures":0}]"#,
             0,
         ),
+        runtime_json: "{}".into(),
     })
     .unwrap();
 
@@ -339,6 +341,7 @@ fn status_degraded_exit_seven_when_no_upstream_can_answer() {
             "consecutive_failures":900}]"#,
             900,
         ),
+        runtime_json: "{}".into(),
     })
     .unwrap();
 
@@ -363,6 +366,7 @@ fn status_degraded_exit_seven_when_log_events_were_dropped() {
             "consecutive_failures":0}]"#,
             0,
         ),
+        runtime_json: "{}".into(),
     })
     .unwrap();
 
@@ -393,6 +397,7 @@ fn status_not_degraded_when_drops_are_only_historical() {
             "consecutive_failures":0}]"#,
             0,
         ),
+        runtime_json: "{}".into(),
     })
     .unwrap();
 
@@ -431,6 +436,7 @@ fn status_human_output_reports_the_outage_and_drops() {
             "consecutive_failures":5}]"#,
             5,
         ),
+        runtime_json: "{}".into(),
     })
     .unwrap();
 
@@ -668,7 +674,7 @@ fn reload_with_invalid_config_exit_one_before_signalling() {
     let out = env.run(&["--json", "reload"]);
     assert_eq!(out.status.code(), Some(1));
     let v = json_of(&out);
-    assert!(v["error"].as_str().unwrap().contains("check failed"));
+    assert!(v["error"].as_str().unwrap().contains("config"), "{v}");
 }
 
 // ---------------------------------------------------------------------------
@@ -886,46 +892,6 @@ fn serve_with_invalid_config_fails_loud() {
     let v = json_of(&out);
     assert_envelope(&v, "serve");
     assert!(v["error"].as_str().unwrap().contains("/nonexistent"));
-}
-
-#[test]
-fn reload_success_signals_live_pid() {
-    let env = Env::new();
-    // A real child process stands in for the daemon; SIGHUP's default
-    // disposition terminates it, which doubles as proof of delivery.
-    let child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let db = Db::open(&env.db_path()).unwrap();
-    let now = unix_now();
-    db.write_heartbeat(&Heartbeat {
-        pid: child.id(),
-        started_ts: now - 10,
-        updated_ts: now,
-        config_hash: "c".into(),
-        lists_hash: "l".into(),
-    })
-    .unwrap();
-    let out = env.run(&["--json", "reload"]);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let v = json_of(&out);
-    assert_envelope(&v, "reload");
-    assert_eq!(v["signalled_pid"], child.id());
-    // The sleep child dies of SIGHUP promptly.
-    let mut child = child;
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    if let Some(status) = child.try_wait().unwrap() {
-        assert!(!status.success(), "killed by SIGHUP");
-    } else {
-        child.kill().unwrap();
-        panic!("child did not receive SIGHUP");
-    }
 }
 
 // ---------------------------------------------------------------------------

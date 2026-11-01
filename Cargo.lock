@@ -2146,6 +2146,7 @@ name = "sumidero"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "hickory-proto",
  "ipnet",
  "nix",
  "serde",
@@ -2153,6 +2154,7 @@ dependencies = [
  "serde_yaml",
  "sumidero-core",
  "sumidero-filter",
+ "sumidero-testkit",
  "tempfile",
  "tokio",
  "tracing-subscriber",

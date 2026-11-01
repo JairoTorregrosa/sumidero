@@ -66,6 +66,61 @@ fn running_text(
     text
 }
 
+/// One line per list in force, then one per degraded reason.
+fn runtime_text(
+    runtime: &sumidero_core::daemon::RuntimeReport,
+    reasons: &[sumidero_core::daemon::Degraded],
+) -> String {
+    let mut text = String::new();
+    for list in &runtime.lists {
+        let confirmed = list
+            .verified_age_secs
+            .map(|s| format!(", confirmed {} h ago", s / 3600))
+            .unwrap_or_default();
+        let _ = write!(
+            text,
+            "\nlist {} ({}, {} rules{confirmed})",
+            list.name,
+            list.origin.as_str(),
+            list.rules
+        );
+    }
+    for r in reasons {
+        let _ = write!(
+            text,
+            "\nDEGRADED {}: {} (next: {})",
+            r.reason, r.detail, r.next
+        );
+    }
+    text
+}
+
+/// The `status` payload when no daemon ever wrote a heartbeat: the same
+/// fields as a running daemon's, all null, so the v1 shape is stable.
+fn never_ran() -> Value {
+    json!({
+        "running": false,
+        "degraded": false,
+        "degraded_reasons": [],
+        "lists": Value::Null,
+        "last_reload": Value::Null,
+        "pending_restart": Value::Null,
+        "next_refresh_ts": Value::Null,
+        "pid": Value::Null,
+        "started_ts": Value::Null,
+        "updated_ts": Value::Null,
+        "heartbeat_age_secs": Value::Null,
+        "config_hash": Value::Null,
+        "lists_hash": Value::Null,
+        "log_events_dropped": Value::Null,
+        "log_events_dropped_recent": Value::Null,
+        "upstreams": Value::Null,
+        "queries_resolved": Value::Null,
+        "queries_all_upstreams_failed": Value::Null,
+        "consecutive_all_upstreams_failed": Value::Null,
+    })
+}
+
 pub fn run(config: &Path, json: bool) -> ExitCode {
     let cfg = match load_config(config) {
         Ok(c) => c,
@@ -100,24 +155,38 @@ pub fn run(config: &Path, json: bool) -> ExitCode {
     let dropped_recent: Value = stats
         .as_ref()
         .map_or(Value::Null, |s| json!(s.log_events_dropped_recent));
-    // A daemon is degraded when it cannot resolve — not when one of
-    // three raced upstreams is between connections.
-    let cannot_resolve = pool["consecutive_all_failed"]
-        .as_u64()
-        .is_some_and(|stuck| stuck > 0);
-
+    let runtime: sumidero_core::daemon::RuntimeReport = stats
+        .as_ref()
+        .and_then(|s| serde_json::from_str(&s.runtime_json).ok())
+        .unwrap_or_default();
     let now = unix_now();
     match hb {
         Some(hb) => {
             let age = now - hb.updated_ts;
             let running = age <= crate::HEARTBEAT_FRESH_SECS;
             // "Running" is not the same as "working": a daemon with every
-            // upstream down still heartbeats happily.
-            let degraded =
-                running && (cannot_resolve || dropped_recent.as_u64().is_some_and(|d| d > 0));
+            // upstream down, or filtering with a week-old NSFW list, still
+            // heartbeats happily. A reconnecting upstream is not a reason:
+            // the race hides it from every client.
+            let reasons = if running {
+                sumidero_core::daemon::degraded_reasons(
+                    &runtime,
+                    pool["consecutive_all_failed"].as_u64().unwrap_or(0),
+                    dropped_recent.as_u64().unwrap_or(0),
+                    now,
+                )
+            } else {
+                Vec::new()
+            };
+            let degraded = !reasons.is_empty();
             let payload = json!({
                 "running": running,
                 "degraded": degraded,
+                "degraded_reasons": reasons,
+                "lists": runtime.lists,
+                "last_reload": runtime.last_reload,
+                "pending_restart": runtime.pending_restart,
+                "next_refresh_ts": runtime.next_refresh_ts,
                 "pid": hb.pid,
                 "started_ts": hb.started_ts,
                 "updated_ts": hb.updated_ts,
@@ -133,6 +202,7 @@ pub fn run(config: &Path, json: bool) -> ExitCode {
             });
             let human = if running {
                 running_text(&hb, age, &pool, &upstreams, &dropped, &dropped_recent)
+                    + &runtime_text(&runtime, &reasons)
             } else {
                 format!(
                     "NOT running: last heartbeat {age}s ago (pid was {})",
@@ -154,22 +224,7 @@ pub fn run(config: &Path, json: bool) -> ExitCode {
         None => emit_code(
             json,
             "status",
-            json!({
-                "running": false,
-                "degraded": false,
-                "pid": Value::Null,
-                "started_ts": Value::Null,
-                "updated_ts": Value::Null,
-                "heartbeat_age_secs": Value::Null,
-                "config_hash": Value::Null,
-                "lists_hash": Value::Null,
-                "log_events_dropped": Value::Null,
-                "log_events_dropped_recent": Value::Null,
-                "upstreams": Value::Null,
-                "queries_resolved": Value::Null,
-                "queries_all_upstreams_failed": Value::Null,
-                "consecutive_all_upstreams_failed": Value::Null,
-            }),
+            never_ran(),
             "NOT running: no heartbeat recorded",
             ExitCode::from(5),
         ),
