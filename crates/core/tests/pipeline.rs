@@ -872,3 +872,81 @@ async fn stale_answer_beats_a_failure_hold() {
         assert_ne!(r.answers.len(), 0, "+{s}s");
     }
 }
+
+// ---------------------------------------------------------------------------
+// CNAME cloaking
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn first_party_alias_of_a_blocked_tracker_is_blocked_on_miss_and_hit() {
+    let f = fixture("||tracker.test^").await;
+    f.up.add_cname("metrics.shop.test", "shop.tracker.test");
+    let q = query("metrics.shop.test.", RecordType::A);
+    for _ in 0..2 {
+        let r = f.pipeline.handle_at(&q, CLIENT, Instant::now()).await;
+        assert_eq!(r.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(r.answers.len(), 0, "no part of the chain leaks");
+    }
+    assert_eq!(
+        f.up.asked("metrics.shop.test"),
+        1,
+        "the second one was a cache hit"
+    );
+    f.db.flush();
+    let rows = f.db.recent_queries(5).unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.verdict == sumidero_core::db::VerdictKind::Blocked)
+    );
+    assert_eq!(
+        rows[0].rule.as_deref(),
+        Some("||tracker.test^ (CNAME target shop.tracker.test)")
+    );
+}
+
+#[tokio::test]
+async fn chain_through_an_allowed_cdn_to_a_blocked_name_is_blocked() {
+    let f = fixture("||adult.test^").await;
+    f.up.add_cname("innocent.test", "edge.cdn.test");
+    f.up.add_cname("edge.cdn.test", "videos.adult.test");
+    let r = f
+        .pipeline
+        .handle_at(
+            &query("innocent.test.", RecordType::AAAA),
+            CLIENT,
+            Instant::now(),
+        )
+        .await;
+    assert_eq!(r.metadata.response_code, ResponseCode::NXDomain);
+}
+
+#[tokio::test]
+async fn exception_on_the_queried_name_covers_its_chain() {
+    let f = fixture("||tracker.test^\n@@||metrics.shop.test^").await;
+    f.up.add_cname("metrics.shop.test", "shop.tracker.test");
+    let r = f
+        .pipeline
+        .handle_at(
+            &query("metrics.shop.test.", RecordType::A),
+            CLIENT,
+            Instant::now(),
+        )
+        .await;
+    assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(r.answers[0].data.record_type(), RecordType::CNAME);
+}
+
+#[tokio::test]
+async fn excepted_target_does_not_block_its_alias() {
+    let f = fixture("||cdn.test^\n@@||good.cdn.test^").await;
+    f.up.add_cname("www.shop.test", "good.cdn.test");
+    let r = f
+        .pipeline
+        .handle_at(
+            &query("www.shop.test.", RecordType::A),
+            CLIENT,
+            Instant::now(),
+        )
+        .await;
+    assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+}
