@@ -270,6 +270,8 @@ struct Refresher {
     started_with: Config,
     /// The config whose lists are in force.
     current: Config,
+    /// For the heartbeat row, rewritten after every load.
+    started_ts: i64,
 }
 
 impl Refresher {
@@ -327,6 +329,16 @@ impl Refresher {
                 .expect("runtime report poisoned")
                 .next_refresh_ts = unix_now() + i64::try_from(wait.as_secs()).unwrap_or(i64::MAX);
             publish_runtime(&self.db, &self.shared).await;
+            // The heartbeat row carries the list and config hashes that
+            // `explain` checks its verdict against: refresh it now, not at
+            // the next minute tick, or `explain` warns about a mismatch
+            // that is only the heartbeat lagging the policy in force.
+            let report = snapshot(&self.shared);
+            if let Err(err) =
+                tokio::task::block_in_place(|| write_heartbeat(&self.db, self.started_ts, &report))
+            {
+                tracing::error!(%err, "heartbeat write failed");
+            }
         }
     }
 }
@@ -428,6 +440,7 @@ pub async fn run(
             shared: Arc::clone(&shared),
             started_with: config.clone(),
             current: config,
+            started_ts,
         }
         .run(reload_rx, refresh_in),
     );
