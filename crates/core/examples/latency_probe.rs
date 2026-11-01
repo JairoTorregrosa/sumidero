@@ -203,6 +203,7 @@ async fn build_target(spec: &str) -> Target {
             ],
             timeout_ms: TIMEOUT_MS,
             extra_roots: Vec::new(),
+            connect_budget: sumidero_core::upstream::DEFAULT_CONNECT_BUDGET,
         };
         let pool = UpstreamPool::new(&cfg)
             .await

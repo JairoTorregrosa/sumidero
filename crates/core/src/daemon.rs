@@ -361,6 +361,7 @@ pub async fn run(
             bootstrap_ips: config.upstreams.bootstrap.clone(),
             timeout_ms: config.upstreams.timeout_ms,
             extra_roots: extra_roots.clone(),
+            connect_budget: crate::upstream::DEFAULT_CONNECT_BUDGET,
         })
         .await?,
     );

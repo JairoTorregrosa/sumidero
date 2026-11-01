@@ -9,7 +9,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
@@ -17,11 +17,8 @@ use hickory_resolver::net::h2::HttpsClientStream;
 use hickory_resolver::net::quic::QuicClientStream;
 use hickory_resolver::net::runtime::{RuntimeProvider, TokioRuntimeProvider};
 use hickory_resolver::net::xfer::{DnsHandle, FirstAnswer};
-#[cfg(test)]
-use hickory_resolver::proto::op::Query;
 use hickory_resolver::proto::op::{DnsRequest, DnsRequestOptions, Message};
 use hickory_resolver::{Resolver, TokioResolver};
-use tokio::sync::RwLock;
 use tokio::time::Instant;
 use url::Url;
 
@@ -69,6 +66,9 @@ pub struct UpstreamConfig {
     pub timeout_ms: u64,
     /// Trust anchors added to the public web PKI (`[tls] extra_roots`).
     pub extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
+    /// How long start-up keeps trying before it gives up
+    /// ([`DEFAULT_CONNECT_BUDGET`] in the daemon).
+    pub connect_budget: Duration,
 }
 
 // ── Internal transport trait ────────────────────────────────────────
@@ -90,7 +90,7 @@ enum SendError {
     Query(String),
 }
 
-/// Abstraction over a single upstream transport so tests can inject fakes.
+/// One established connection (`DoH` or `DoQ`), type-erased.
 trait Transport: Send + Sync + 'static {
     /// Send a DNS message and return the response.
     fn send_query(&self, msg: Message) -> BoxSendFuture<'_, Result<Message, SendError>>;
@@ -290,22 +290,13 @@ async fn build_transport(
     }
 }
 
-// ── Transport factories ─────────────────────────────────────────────
+// ── Connection factory ──────────────────────────────────────────────
 
-/// Builds a fresh transport for one upstream, on demand.
+/// Builds a fresh connection to one upstream, on demand.
 ///
-/// A [`ReconnectingUpstream`] calls this every time it needs a new
-/// connection, so each rebuild also re-resolves the upstream hostname
-/// through the bootstrap servers: a daemon that runs for months must
-/// follow upstream IP changes.
-trait TransportFactory: Send + Sync + 'static {
-    /// Establish a new connection to this upstream.
-    fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>>;
-    /// The configured URL, used in logs and health output.
-    fn label(&self) -> &str;
-}
-
-/// Factory for a real network upstream.
+/// Every rebuild re-resolves the upstream hostname through the bootstrap
+/// servers: a daemon that runs for months must follow upstream IP
+/// changes.
 struct NetworkFactory {
     kind: UpstreamKind,
     bootstrap_ips: Vec<IpAddr>,
@@ -313,15 +304,13 @@ struct NetworkFactory {
     tls: Arc<rustls::ClientConfig>,
 }
 
-impl TransportFactory for NetworkFactory {
-    fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-        Box::pin(async move {
-            let host = match &self.kind {
-                UpstreamKind::Https { host, .. } | UpstreamKind::Quic { host, .. } => host,
-            };
-            let ip = bootstrap_resolve(host, &self.bootstrap_ips).await?;
-            build_transport(&self.kind, ip, &self.tls).await
-        })
+impl NetworkFactory {
+    async fn build(&self) -> Result<Arc<dyn Transport>, Error> {
+        let host = match &self.kind {
+            UpstreamKind::Https { host, .. } | UpstreamKind::Quic { host, .. } => host,
+        };
+        let ip = bootstrap_resolve(host, &self.bootstrap_ips).await?;
+        build_transport(&self.kind, ip, &self.tls).await
     }
 
     fn label(&self) -> &str {
@@ -348,36 +337,59 @@ const MIN_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 /// Longest wait between two connection attempts when the *build* fails
 /// (connection refused, handshake error): the upstream is hard-down.
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
-/// Longest wait between rebuilds when builds *succeed* but the fresh
-/// connections keep failing their sends (the upstream accepts
-/// connections it cannot serve). Kept short: this also bounds how long
-/// a recovered upstream waits before it is retried, and the race means
-/// other upstreams cover the gap.
-const MAX_REBUILD_HOLDDOWN: Duration = Duration::from_secs(5);
-
-/// At startup the network is often not routable yet (the NIC is still
-/// coming up) or one upstream is briefly unreachable. Treat that as a
-/// *transient* condition: keep retrying to connect the upstreams until at
-/// least one is live or this budget is spent. Only then does `new` give
-/// up and return `Error::Init`, so systemd restarts the process — the
-/// loud, visible process-level retry. This is deliberately NOT a silent
-/// fallback: a pool that came up serving zero upstreams would look
-/// healthy while resolving nothing.
-const INIT_MAX_RETRY: Duration = Duration::from_secs(30);
-/// First wait between startup connection rounds.
+/// Longest probation after a successful build: if the fresh connection
+/// fails before answering once, the next rebuild waits this long at
+/// most (the upstream accepts connections it cannot serve). Short,
+/// because it also bounds how long a recovered upstream waits, and the
+/// race lets the other upstreams cover the gap.
+const MAX_PROBATION: Duration = Duration::from_secs(5);
+/// Start-up: how long `UpstreamPool::new` keeps trying before it gives
+/// up and the process exits for systemd to restart it.
+pub const DEFAULT_CONNECT_BUDGET: Duration = Duration::from_secs(30);
+/// First wait between start-up connection rounds.
 const INIT_RETRY_BACKOFF_START: Duration = Duration::from_millis(500);
-/// Longest wait between startup connection rounds.
+/// Longest wait between start-up connection rounds.
 const INIT_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// The mutable connection state of one upstream.
-struct Slot {
-    /// Bumped on every successful build; lets a task tell "the transport
-    /// I just used" from "a replacement someone else already installed".
-    generation: u64,
-    /// `None` means disconnected — a detached repair task rebuilds.
-    transport: Option<Arc<dyn Transport>>,
-    /// Earliest instant at which another build attempt may run.
-    next_attempt: Option<Instant>,
+/// The connection state of one upstream. Every transition happens under
+/// one short `std::sync::Mutex` section; no lock is held across an
+/// `.await`.
+///
+/// ```text
+///            build ok                     first answer
+///  Down ───────────────▶ Connected{probation} ──────▶ Connected{proven}
+///   ▲  ▲   (Connecting)        │                            │
+///   │  └─ build fails ◀────────┘ fails before answering     │ send fails
+///   │     retry_at = now+backoff   retry_at = probation end │ (idle drop,
+///   └───────────────────────────────────────────────────────┘  GOAWAY, hang)
+///                         retry_at = now
+/// ```
+enum ConnState {
+    /// No connection. A build may start once `retry_at` has passed.
+    Down {
+        retry_at: Instant,
+        last_error: String,
+    },
+    /// A detached task is building a connection.
+    Connecting,
+    /// A connection is installed. `probation_until` is `Some` until it
+    /// answers once: a failure before then waits out the probation
+    /// before the next build.
+    Connected {
+        generation: u64,
+        transport: Arc<dyn Transport>,
+        probation_until: Option<Instant>,
+    },
+}
+
+impl ConnState {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Down { .. } => "down",
+            Self::Connecting => "connecting",
+            Self::Connected { .. } => "connected",
+        }
+    }
 }
 
 /// Health snapshot for the whole pool.
@@ -406,13 +418,15 @@ pub struct PoolHealth {
 pub struct UpstreamHealth {
     /// The configured upstream URL.
     pub url: String,
-    /// Whether a live connection is currently held.
-    ///
-    /// Informational only, and **not** a health signal: connections are
-    /// rebuilt lazily on the next query, so a perfectly healthy upstream
-    /// reads `false` between a connection dropping and the next query
-    /// that needs it. Use `last_success_secs_ago` to judge health.
+    /// `connected`, `connecting` or `down`. Informational: connections
+    /// are rebuilt on demand, so a healthy upstream can read `down`
+    /// between an idle drop and the next query. Judge health by
+    /// `last_success_secs_ago`.
+    pub state: &'static str,
+    /// Whether a connection is installed (`state == "connected"`).
     pub connected: bool,
+    /// Why the last connection attempt failed, while `down`.
+    pub last_error: Option<String>,
     /// Seconds since this upstream last answered, or `None` if it never
     /// has.
     pub last_success_secs_ago: Option<u64>,
@@ -439,19 +453,18 @@ pub struct UpstreamHealth {
 /// noticed the death: queries race across upstreams and the losers are
 /// cancelled, so a repair owned by a query would be abandoned whenever
 /// a faster upstream answered first — and a consistently slower
-/// upstream would never recover. Queries that find the slot empty wait
+/// upstream would never recover. Queries that find no connection wait
 /// (bounded by their deadline) for the repair's outcome instead.
 struct ReconnectingUpstream {
-    factory: Box<dyn TransportFactory>,
-    slot: RwLock<Slot>,
-    /// Wait before the next build attempt, doubled on each rebuild that
-    /// is not followed by a successful send; reset on success. Millis,
-    /// atomic so the success path never takes the slot write lock.
+    factory: NetworkFactory,
+    state: std::sync::Mutex<ConnState>,
+    /// Builds so far; tags each connection so a failure on an old one
+    /// cannot tear down its replacement.
+    builds: AtomicU64,
+    /// Wait before the next build after a failure; doubled per failure,
+    /// reset by an answer.
     backoff_ms: AtomicU64,
-    /// A detached repair task is currently running (dedup: at most one).
-    repairing: AtomicBool,
-    /// Bumped every time a repair attempt concludes (either way), so
-    /// queries waiting for a transport can re-check the slot.
+    /// Bumped whenever a build concludes, so waiting queries re-check.
     repair_done: tokio::sync::watch::Sender<u64>,
     /// Bound on one connection build (bootstrap DNS + TCP/QUIC + TLS).
     build_timeout: Duration,
@@ -459,216 +472,182 @@ struct ReconnectingUpstream {
     failures: AtomicU64,
     reconnects: AtomicU64,
     consecutive_failures: AtomicU64,
-    connected: AtomicBool,
     /// Unix seconds of the last successful answer; 0 means never.
     last_success_ts: AtomicI64,
 }
 
 impl ReconnectingUpstream {
-    /// Build the initial connection, failing if it cannot be established
-    /// within `build_timeout`. Test-only: production startup goes through
-    /// [`UpstreamPool::assemble_with_retry`], which retries and tolerates
-    /// an upstream that is down at boot.
-    #[cfg(test)]
-    async fn connect(
-        factory: Box<dyn TransportFactory>,
-        build_timeout: Duration,
-    ) -> Result<Self, Error> {
-        let transport = tokio::time::timeout(build_timeout, factory.build())
-            .await
-            .map_err(|_| {
-                Error::Init(format!("{}: initial connection timed out", factory.label()))
-            })??;
-        Ok(Self::with_transport(factory, transport, build_timeout))
-    }
-
-    /// Wrap an already-established connection.
-    fn with_transport(
-        factory: Box<dyn TransportFactory>,
-        transport: Arc<dyn Transport>,
-        build_timeout: Duration,
-    ) -> Self {
+    fn new(factory: NetworkFactory, initial: ConnState, build_timeout: Duration) -> Self {
+        let builds = u64::from(matches!(initial, ConnState::Connected { .. }));
         Self {
             factory,
-            slot: RwLock::new(Slot {
-                generation: 0,
-                transport: Some(transport),
-                next_attempt: None,
-            }),
+            state: std::sync::Mutex::new(initial),
+            builds: AtomicU64::new(builds),
             backoff_ms: AtomicU64::new(duration_to_millis(MIN_RECONNECT_BACKOFF)),
-            repairing: AtomicBool::new(false),
             repair_done: tokio::sync::watch::Sender::new(0),
             build_timeout,
             queries: AtomicU64::new(0),
             failures: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
             consecutive_failures: AtomicU64::new(0),
-            connected: AtomicBool::new(true),
             last_success_ts: AtomicI64::new(0),
         }
     }
 
-    /// Wrap an upstream that has **not** connected yet.
-    ///
-    /// The slot starts empty with no back-off, so the first `acquire`
-    /// (or the pool's query fan-out) triggers a repair immediately and
-    /// the upstream joins the pool as soon as it becomes reachable. Used
-    /// at startup for upstreams that were unreachable while at least one
-    /// other upstream did come up: the pool must not lose them for the
-    /// lifetime of the process just because they were down at boot.
-    fn disconnected(factory: Box<dyn TransportFactory>, build_timeout: Duration) -> Self {
-        Self {
-            factory,
-            slot: RwLock::new(Slot {
-                generation: 0,
-                transport: None,
-                next_attempt: None,
-            }),
-            backoff_ms: AtomicU64::new(duration_to_millis(MIN_RECONNECT_BACKOFF)),
-            repairing: AtomicBool::new(false),
-            repair_done: tokio::sync::watch::Sender::new(0),
-            build_timeout,
-            queries: AtomicU64::new(0),
-            failures: AtomicU64::new(0),
-            reconnects: AtomicU64::new(0),
-            consecutive_failures: AtomicU64::new(0),
-            connected: AtomicBool::new(false),
-            last_success_ts: AtomicI64::new(0),
-        }
+    fn lock(&self) -> std::sync::MutexGuard<'_, ConnState> {
+        self.state.lock().expect("upstream state poisoned")
     }
 
-    /// Spawn the detached repair task, unless one is already running.
+    /// `Down` and due → `Connecting`, and spawn the build. Anything
+    /// else is left alone (a build is running, or the connection is up,
+    /// or the retry time has not come).
     fn trigger_repair(self: &Arc<Self>) {
-        if self.repairing.swap(true, Ordering::AcqRel) {
-            return;
+        {
+            let mut state = self.lock();
+            match &*state {
+                ConnState::Down { retry_at, .. } if Instant::now() >= *retry_at => {
+                    *state = ConnState::Connecting;
+                }
+                _ => return,
+            }
         }
         let this = Arc::clone(self);
         tokio::spawn(async move { this.repair().await });
     }
 
-    /// One repair attempt: build a fresh connection and install it.
-    ///
-    /// Runs detached from any query, so a cancelled query can never
-    /// abandon it half-done. The build itself happens *outside* the
-    /// slot lock; `repairing` already guarantees a single builder, so
-    /// queries only ever wait on the lock for O(1) critical sections.
+    /// Build a connection and install it (`Connecting` → `Connected` or
+    /// `Down`). Detached from every query.
     async fn repair(self: Arc<Self>) {
-        // Clear `repairing` and wake waiters however this task ends —
-        // including a panic or the task being dropped at an await point
-        // during shutdown. A stuck flag would block every future repair,
-        // leaving the upstream dead until process restart.
+        // However this task ends — including being dropped at an await
+        // during shutdown — it must not leave the upstream `Connecting`
+        // forever, and waiters must wake.
         struct Concluded<'a>(&'a ReconnectingUpstream);
         impl Drop for Concluded<'_> {
             fn drop(&mut self) {
-                self.0.repairing.store(false, Ordering::Release);
+                if let Ok(mut state) = self.0.state.lock()
+                    && matches!(*state, ConnState::Connecting)
+                {
+                    *state = ConnState::Down {
+                        retry_at: Instant::now(),
+                        last_error: "connection build abandoned".to_owned(),
+                    };
+                }
                 self.0.repair_done.send_modify(|n| *n += 1);
             }
         }
         let _concluded = Concluded(&self);
 
-        let should_build = {
-            let slot = self.slot.read().await;
-            // Nothing to do if a transport is already installed, and
-            // don't build while a backoff window is still open.
-            slot.transport.is_none() && slot.next_attempt.is_none_or(|next| Instant::now() >= next)
+        let built = match tokio::time::timeout(self.build_timeout, self.factory.build()).await {
+            Ok(Ok(transport)) => Ok(transport),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err("connection build timed out".to_owned()),
         };
-        if should_build {
-            let built = match tokio::time::timeout(self.build_timeout, self.factory.build()).await {
-                Ok(Ok(transport)) => Ok(transport),
-                Ok(Err(err)) => Err(err.to_string()),
-                Err(_) => Err("connection build timed out".to_owned()),
-            };
-            let backoff = Duration::from_millis(self.backoff_ms.load(Ordering::Relaxed));
-            let mut slot = self.slot.write().await;
-            match built {
-                Ok(transport) => {
-                    slot.generation += 1;
-                    slot.transport = Some(transport);
-                    // Rate-limit the next rebuild: if this connection also
-                    // fails without a single successful send, the upstream
-                    // is accepting connections it cannot serve, and each
-                    // rebuild costs a full handshake. Cap the *applied*
-                    // holddown too: the ladder may have climbed to the 30s
-                    // build-failure cap during an outage, and a working
-                    // connection must never inherit a 30s retry gap.
-                    slot.next_attempt = Some(Instant::now() + backoff.min(MAX_REBUILD_HOLDDOWN));
-                    self.backoff_ms.store(
-                        duration_to_millis((backoff * 2).min(MAX_REBUILD_HOLDDOWN)),
-                        Ordering::Relaxed,
-                    );
-                    self.reconnects.fetch_add(1, Ordering::Relaxed);
-                    self.connected.store(true, Ordering::Relaxed);
-                    tracing::info!(upstream = self.factory.label(), "upstream reconnected");
-                }
-                Err(err) => {
-                    slot.next_attempt = Some(Instant::now() + backoff);
-                    self.backoff_ms.store(
-                        duration_to_millis((backoff * 2).min(MAX_RECONNECT_BACKOFF)),
-                        Ordering::Relaxed,
-                    );
-                    tracing::warn!(
-                        upstream = self.factory.label(),
-                        %err,
-                        "upstream reconnect failed"
-                    );
-                }
+        let backoff = Duration::from_millis(self.backoff_ms.load(Ordering::Relaxed));
+        match built {
+            Ok(transport) => {
+                let generation = self.builds.fetch_add(1, Ordering::Relaxed) + 1;
+                *self.lock() = ConnState::Connected {
+                    generation,
+                    transport,
+                    // A connection that never answers must not be
+                    // rebuilt in a tight loop; a 30 s ladder from an
+                    // outage must not delay a working one either.
+                    probation_until: Some(Instant::now() + backoff.min(MAX_PROBATION)),
+                };
+                self.backoff_ms.store(
+                    duration_to_millis((backoff * 2).min(MAX_PROBATION)),
+                    Ordering::Relaxed,
+                );
+                self.reconnects.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(upstream = self.factory.label(), "upstream connected");
+            }
+            Err(err) => {
+                tracing::warn!(
+                    upstream = self.factory.label(),
+                    %err,
+                    retry_in_ms = duration_to_millis(backoff),
+                    "upstream connection failed"
+                );
+                *self.lock() = ConnState::Down {
+                    retry_at: Instant::now() + backoff,
+                    last_error: err,
+                };
+                self.backoff_ms.store(
+                    duration_to_millis((backoff * 2).min(MAX_RECONNECT_BACKOFF)),
+                    Ordering::Relaxed,
+                );
             }
         }
     }
 
-    /// Return a usable transport, waiting (up to `deadline`) for the
-    /// detached repair if the slot is empty.
+    /// A usable connection, waiting (up to `deadline`) for a build.
     async fn acquire(
         self: &Arc<Self>,
         deadline: Instant,
     ) -> Result<(u64, Arc<dyn Transport>), String> {
         loop {
-            // Subscribe before reading the slot: a repair concluding
-            // between the read and the wait then wakes us immediately.
+            // Subscribe before reading: a build that concludes between
+            // the read and the wait then wakes us at once.
             let mut done = self.repair_done.subscribe();
             {
-                let slot = self.slot.read().await;
-                if let Some(transport) = slot.transport.clone() {
-                    return Ok((slot.generation, transport));
-                }
-                if let Some(next) = slot.next_attempt
-                    && Instant::now() < next
-                {
-                    return Err(format!(
-                        "{}: disconnected, reconnect backing off",
-                        self.factory.label()
-                    ));
+                let state = self.lock();
+                match &*state {
+                    ConnState::Connected {
+                        generation,
+                        transport,
+                        ..
+                    } => return Ok((*generation, Arc::clone(transport))),
+                    ConnState::Down {
+                        retry_at,
+                        last_error,
+                    } if Instant::now() < *retry_at => {
+                        return Err(format!(
+                            "{}: down, next connection attempt in {} ms (last error: {last_error})",
+                            self.factory.label(),
+                            duration_to_millis(retry_at.saturating_duration_since(Instant::now()))
+                        ));
+                    }
+                    ConnState::Down { .. } | ConnState::Connecting => {}
                 }
             }
             self.trigger_repair();
-            match tokio::time::timeout_at(deadline, done.changed()).await {
-                Ok(_) => {} // repair concluded (or sender replaced): re-check
-                Err(_) => {
-                    return Err(format!(
-                        "{}: timed out waiting for reconnect",
-                        self.factory.label()
-                    ));
-                }
+            if tokio::time::timeout_at(deadline, done.changed())
+                .await
+                .is_err()
+            {
+                return Err(format!(
+                    "{}: timed out waiting for a connection",
+                    self.factory.label()
+                ));
             }
         }
     }
 
-    /// Drop the transport of `generation`, unless it was already
-    /// replaced, and kick off a detached repair.
-    async fn invalidate(self: &Arc<Self>, generation: u64) {
-        let empty = {
-            let mut slot = self.slot.write().await;
-            if slot.generation == generation {
-                slot.transport = None;
-                self.connected.store(false, Ordering::Relaxed);
+    /// The connection of `generation` failed: drop it (unless already
+    /// replaced) and start a rebuild when one is due.
+    fn invalidate(self: &Arc<Self>, generation: u64, why: &str) {
+        {
+            let mut state = self.lock();
+            let ConnState::Connected {
+                generation: current,
+                probation_until,
+                ..
+            } = &*state
+            else {
+                return;
+            };
+            if *current != generation {
+                return;
             }
-            slot.transport.is_none()
-        };
-        if empty {
-            // The spawn happens before this function returns, so even if
-            // the calling query is cancelled right after, the repair runs.
-            self.trigger_repair();
+            let retry_at = probation_until.unwrap_or_else(Instant::now);
+            *state = ConnState::Down {
+                retry_at,
+                last_error: why.to_owned(),
+            };
         }
+        // The spawn happens before this returns, so even if the calling
+        // query is cancelled right after, the repair runs.
+        self.trigger_repair();
     }
 
     /// Send one query within `deadline`, reconnecting once if the
@@ -680,32 +659,30 @@ impl ReconnectingUpstream {
             Ok(pair) => pair,
             Err(err) => return Err(self.record_failure(err)),
         };
-
         let first_err =
             match tokio::time::timeout_at(deadline, transport.send_query(msg.clone())).await {
-                Ok(Ok(response)) => return self.judge(response).await,
-                Ok(Err(SendError::Query(err))) => {
-                    // One bad answer does not condemn the connection.
-                    return Err(self.record_failure(err));
-                }
+                Ok(Ok(response)) => return self.judge(response),
+                // One bad answer does not condemn the connection.
+                Ok(Err(SendError::Query(err))) => return Err(self.record_failure(err)),
                 Ok(Err(SendError::Fatal(err))) => err,
                 Err(_) => {
                     // A silent hang poisons every query multiplexed onto
-                    // this connection: tear it down like any fatal error.
-                    self.invalidate(generation).await;
+                    // this connection: tear it down like a fatal error.
+                    self.invalidate(generation, "query timed out on this connection");
                     return Err(self.record_failure(format!("{}: timed out", self.factory.label())));
                 }
             };
 
-        // A dead exchange fails every subsequent send the same way, so
-        // retrying on the same transport is pointless: replace it.
-        tracing::warn!(
+        // A dead exchange fails every later send the same way: replace
+        // it. Servers close idle connections routinely (Quad9 every
+        // minute), so this is an event, not a warning, unless the
+        // replacement fails too.
+        tracing::info!(
             upstream = self.factory.label(),
             err = %first_err,
-            "upstream send failed; reconnecting"
+            "connection closed by the upstream; reconnecting"
         );
-        self.invalidate(generation).await;
-
+        self.invalidate(generation, &first_err);
         let (generation, fresh) = match self.acquire(deadline).await {
             Ok(pair) => pair,
             Err(err) => return Err(self.record_failure(format!("{first_err}; {err}"))),
@@ -713,17 +690,16 @@ impl ReconnectingUpstream {
         match tokio::time::timeout_at(deadline, fresh.send_query(msg)).await {
             Ok(Ok(response)) => self
                 .judge(response)
-                .await
                 .map_err(|err| format!("{first_err}; after reconnect: {err}")),
             Ok(Err(SendError::Query(err))) => {
                 Err(self.record_failure(format!("{first_err}; after reconnect: {err}")))
             }
             Ok(Err(SendError::Fatal(err))) => {
-                self.invalidate(generation).await;
+                self.invalidate(generation, &err);
                 Err(self.record_failure(format!("{first_err}; after reconnect: {err}")))
             }
             Err(_) => {
-                self.invalidate(generation).await;
+                self.invalidate(generation, "query timed out on this connection");
                 Err(self.record_failure(format!(
                     "{first_err}; after reconnect: {}: timed out",
                     self.factory.label()
@@ -734,12 +710,12 @@ impl ReconnectingUpstream {
 
     /// Accept or reject a transport-level success by its rcode.
     ///
-    /// SERVFAIL/REFUSED/NOTIMP are unusable answers: they must count as
-    /// this upstream failing — the health counters drive an operator
-    /// alert, and an upstream that "answers" only SERVFAIL is exactly
-    /// the failure the alert exists for. The connection stays: rcode is
-    /// the server's verdict on the query, not on the transport.
-    async fn judge(&self, response: Message) -> Result<Message, String> {
+    /// SERVFAIL/REFUSED/NOTIMP are unusable answers: they count as this
+    /// upstream failing (the health counters drive an operator alert,
+    /// and an upstream that "answers" only SERVFAIL is exactly what the
+    /// alert is for). The connection stays: rcode is the server's
+    /// verdict on the query, not on the transport.
+    fn judge(&self, response: Message) -> Result<Message, String> {
         use hickory_resolver::proto::op::ResponseCode;
         let rcode = response.metadata.response_code;
         if matches!(
@@ -751,22 +727,21 @@ impl ReconnectingUpstream {
                 self.factory.label()
             )));
         }
-        self.record_success().await;
+        self.record_success();
         Ok(response)
     }
 
-    /// Note an answered query.
-    async fn record_success(&self) {
+    /// An answer: the connection is proven, the backoff resets.
+    fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.last_success_ts.store(unix_now(), Ordering::Relaxed);
         self.backoff_ms
             .store(duration_to_millis(MIN_RECONNECT_BACKOFF), Ordering::Relaxed);
-        // Clear any pending holddown: this connection just proved
-        // usable, so its eventual replacement must not be delayed by a
-        // backoff earned during a previous outage.
-        let pending = { self.slot.read().await.next_attempt.is_some() };
-        if pending {
-            self.slot.write().await.next_attempt = None;
+        if let ConnState::Connected {
+            probation_until, ..
+        } = &mut *self.lock()
+        {
+            *probation_until = None;
         }
     }
 
@@ -779,9 +754,19 @@ impl ReconnectingUpstream {
 
     fn health(&self) -> UpstreamHealth {
         let last = self.last_success_ts.load(Ordering::Relaxed);
+        let (state, last_error) = {
+            let state = self.lock();
+            let err = match &*state {
+                ConnState::Down { last_error, .. } => Some(last_error.clone()),
+                _ => None,
+            };
+            (state.name(), err)
+        };
         UpstreamHealth {
             url: self.factory.label().to_owned(),
-            connected: self.connected.load(Ordering::Relaxed),
+            state,
+            connected: state == "connected",
+            last_error,
             last_success_secs_ago: (last > 0)
                 .then(|| unix_now().saturating_sub(last).max(0).cast_unsigned()),
             queries: self.queries.load(Ordering::Relaxed),
@@ -838,32 +823,58 @@ impl fmt::Debug for UpstreamPool {
     }
 }
 
+/// Validate every URL and build its connection factory. Configuration
+/// errors are fatal here: they are not transient.
+fn factories(
+    cfg: &UpstreamConfig,
+    tls: &Arc<rustls::ClientConfig>,
+) -> Result<Vec<NetworkFactory>, Error> {
+    let mut factories = Vec::with_capacity(cfg.urls.len());
+    for raw_url in &cfg.urls {
+        let kind = parse_upstream_url(raw_url)?;
+        if cfg.bootstrap_ips.is_empty() {
+            let host = match &kind {
+                UpstreamKind::Https { host, .. } | UpstreamKind::Quic { host, .. } => host,
+            };
+            if host.parse::<IpAddr>().is_err() {
+                return Err(Error::Init(format!(
+                    "bootstrap_ips is empty and upstream '{raw_url}' requires resolution"
+                )));
+            }
+        }
+        factories.push(NetworkFactory {
+            kind,
+            bootstrap_ips: cfg.bootstrap_ips.clone(),
+            url: raw_url.clone(),
+            tls: Arc::clone(tls),
+        });
+    }
+    Ok(factories)
+}
+
 impl UpstreamPool {
     /// Build a new pool from configuration.
     ///
     /// URLs are validated up front — a malformed/unsupported URL, or a
     /// hostname upstream with no bootstrap servers, is a *configuration*
-    /// error and fails fast. Then every upstream is connected, retrying
-    /// with back-off for up to [`INIT_MAX_RETRY`]: the pool comes up as
-    /// soon as **at least one** upstream is live (this is what `resolve`
-    /// already needs — it races all upstreams and any one answering
-    /// wins). Upstreams still down when the pool comes up are kept as
-    /// self-healing [`ReconnectingUpstream::disconnected`] members and
-    /// rejoin automatically once reachable — a single dead upstream can
-    /// no longer keep the whole LAN's DNS server from starting.
+    /// error and fails fast. Then every upstream connects **in
+    /// parallel**, in rounds, until at least one is live or
+    /// `connect_budget` is spent. Upstreams still down when the pool
+    /// comes up join as `Down` and connect on demand — a single dead
+    /// upstream can no longer keep the whole LAN's DNS server from
+    /// starting, nor delay it by its timeout.
     ///
-    /// If **no** upstream can be reached within [`INIT_MAX_RETRY`], `new`
-    /// returns [`Error::Init`] and the process exits, so systemd restarts
-    /// it. That is deliberate: a DNS server that "came up" with zero
-    /// working upstreams would look healthy while resolving nothing, and
-    /// a loud crash-and-restart is always preferable to that.
+    /// If **no** upstream connects within the budget, `new` returns
+    /// [`Error::Init`] and the process exits for systemd to restart it:
+    /// a DNS server that "came up" with zero working upstreams would
+    /// look healthy while resolving nothing.
     ///
     /// # Errors
     ///
     /// - [`Error::UnsupportedUrl`] if a URL is malformed or uses an
     ///   unsupported scheme.
     /// - [`Error::Init`] on empty/invalid config, or if no upstream could
-    ///   be connected within [`INIT_MAX_RETRY`].
+    ///   be connected within the budget.
     pub async fn new(cfg: &UpstreamConfig) -> Result<Self, Error> {
         if cfg.urls.is_empty() {
             return Err(Error::Init("no upstream URLs configured".into()));
@@ -875,147 +886,96 @@ impl UpstreamPool {
         let timeout = Duration::from_millis(cfg.timeout_ms);
         let tls = Arc::new(build_rustls_client_config(&cfg.extra_roots)?);
 
-        // Validate every URL and build a factory per upstream. Config
-        // errors are fatal here — they are not transient, so retrying
-        // would only delay a crash that must happen anyway.
-        let mut factories: Vec<Box<dyn TransportFactory>> = Vec::with_capacity(cfg.urls.len());
-        for raw_url in &cfg.urls {
-            let kind = parse_upstream_url(raw_url)?;
-            if cfg.bootstrap_ips.is_empty() {
-                let host = match &kind {
-                    UpstreamKind::Https { host, .. } | UpstreamKind::Quic { host, .. } => host,
-                };
-                if host.parse::<IpAddr>().is_err() {
-                    return Err(Error::Init(format!(
-                        "bootstrap_ips is empty and upstream '{raw_url}' requires resolution"
-                    )));
-                }
-            }
-            factories.push(Box::new(NetworkFactory {
-                kind,
-                bootstrap_ips: cfg.bootstrap_ips.clone(),
-                url: raw_url.clone(),
-                tls: Arc::clone(&tls),
-            }));
-        }
+        let factories = factories(cfg, &tls)?;
 
-        Self::assemble_with_retry(factories, timeout, INIT_MAX_RETRY).await
-    }
-
-    /// Connect `factories`, retrying with back-off until at least one is
-    /// live or `budget` is spent, then assemble the pool. Live upstreams
-    /// join connected; the rest join disconnected and self-heal. Returns
-    /// [`Error::Init`] only if not a single upstream connects in `budget`.
-    ///
-    /// `factory.build()` borrows `&self`, so a failed factory can simply
-    /// be retried next round without being reconstructed.
-    async fn assemble_with_retry(
-        factories: Vec<Box<dyn TransportFactory>>,
-        timeout: Duration,
-        budget: Duration,
-    ) -> Result<Self, Error> {
-        let n = factories.len();
-        // `factories[i]` is taken once its upstream connects (moved into
-        // the live `ReconnectingUpstream`); `live[i]` holds the result.
-        let mut factories: Vec<Option<Box<dyn TransportFactory>>> =
-            factories.into_iter().map(Some).collect();
-        let mut live: Vec<Option<Arc<ReconnectingUpstream>>> = vec![None; n];
-
-        let started = Instant::now();
+        let deadline = Instant::now() + cfg.connect_budget;
+        let mut built: Vec<Option<Arc<dyn Transport>>> = vec![None; factories.len()];
+        let mut errors: Vec<String> = vec![String::new(); factories.len()];
         let mut backoff = INIT_RETRY_BACKOFF_START;
         loop {
-            let mut errs: Vec<String> = Vec::new();
-            for i in 0..n {
-                if live[i].is_some() {
-                    continue;
-                }
-                // Scope the immutable borrow to the await so the slot can
-                // be taken mutably right after on success.
-                let built = {
-                    let factory = factories[i].as_ref().expect("pending factory present");
-                    tokio::time::timeout(timeout, factory.build()).await
-                };
-                match built {
-                    Ok(Ok(transport)) => {
-                        let factory = factories[i].take().expect("pending factory present");
-                        let label = factory.label().to_owned();
-                        live[i] = Some(Arc::new(ReconnectingUpstream::with_transport(
-                            factory, transport, timeout,
-                        )));
-                        tracing::info!(upstream = %label, "upstream connected at startup");
-                    }
-                    Ok(Err(e)) => {
-                        let label = factories[i].as_ref().map(|f| f.label().to_owned());
-                        tracing::warn!(
-                            upstream = label.as_deref().unwrap_or("?"),
-                            err = %e,
-                            "upstream not ready at startup; will retry"
+            // One round: every still-down upstream at once, each bounded
+            // by the per-attempt timeout and by the overall deadline.
+            let round_deadline = (Instant::now() + timeout).min(deadline);
+            let attempts = factories
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| built[*i].is_none())
+                .map(|(i, factory)| async move {
+                    let result =
+                        match tokio::time::timeout_at(round_deadline, factory.build()).await {
+                            Ok(Ok(transport)) => Ok(transport),
+                            Ok(Err(err)) => Err(err.to_string()),
+                            Err(_) => Err("connection timed out".to_owned()),
+                        };
+                    (i, result)
+                });
+            for (i, result) in futures::future::join_all(attempts).await {
+                match result {
+                    Ok(transport) => {
+                        tracing::info!(
+                            upstream = factories[i].label(),
+                            "upstream connected at startup"
                         );
-                        errs.push(format!("{}: {e}", label.as_deref().unwrap_or("?")));
+                        built[i] = Some(transport);
                     }
-                    Err(_) => {
-                        let label = factories[i].as_ref().map(|f| f.label().to_owned());
-                        tracing::warn!(
-                            upstream = label.as_deref().unwrap_or("?"),
-                            "upstream connection timed out at startup; will retry"
-                        );
-                        errs.push(format!(
-                            "{}: initial connection timed out",
-                            label.as_deref().unwrap_or("?")
-                        ));
+                    Err(err) => {
+                        tracing::warn!(upstream = factories[i].label(), %err, "upstream not ready at startup");
+                        errors[i] = format!("{}: {err}", factories[i].label());
                     }
                 }
             }
-
-            let n_live = live.iter().filter(|u| u.is_some()).count();
-            if n_live > 0 {
-                if n_live < n {
+            let live = built.iter().filter(|b| b.is_some()).count();
+            if live > 0 {
+                if live < factories.len() {
                     tracing::warn!(
-                        live = n_live,
-                        total = n,
-                        "upstream pool starting with some upstreams down; they will self-heal"
+                        live,
+                        total = factories.len(),
+                        "starting with some upstreams down; they connect on demand"
                     );
                 }
                 break;
             }
-
-            if started.elapsed() >= budget {
+            if Instant::now() + backoff >= deadline {
                 return Err(Error::Init(format!(
-                    "no upstream could be connected within {budget:?}; giving up (the process \
+                    "no upstream could be connected within {:?}; giving up (the process \
                      will exit and systemd will restart it): {}",
-                    errs.join("; ")
+                    cfg.connect_budget,
+                    errors.join("; ")
                 )));
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(INIT_RETRY_BACKOFF_MAX);
         }
 
-        // Assemble: live upstreams as connected, the rest as self-healing.
-        let mut upstreams: Vec<Arc<ReconnectingUpstream>> = Vec::with_capacity(n);
-        for i in 0..n {
-            if let Some(up) = live[i].take() {
-                upstreams.push(up);
-            } else {
-                let factory = factories[i].take().expect("unconnected factory present");
-                upstreams.push(Arc::new(ReconnectingUpstream::disconnected(
-                    factory, timeout,
-                )));
-            }
-        }
-        Ok(Self::assemble(upstreams, timeout))
-    }
-
-    fn assemble(upstreams: Vec<Arc<ReconnectingUpstream>>, timeout: Duration) -> Self {
-        Self {
+        let upstreams = factories
+            .into_iter()
+            .zip(built)
+            .zip(errors)
+            .map(|((factory, transport), error)| {
+                let initial = match transport {
+                    Some(transport) => ConnState::Connected {
+                        generation: 1,
+                        transport,
+                        probation_until: None,
+                    },
+                    None => ConnState::Down {
+                        retry_at: Instant::now(),
+                        last_error: error,
+                    },
+                };
+                Arc::new(ReconnectingUpstream::new(factory, initial, timeout))
+            })
+            .collect();
+        Ok(Self {
             upstreams,
             timeout,
             resolved: AtomicU64::new(0),
             all_failed_total: AtomicU64::new(0),
             consecutive_all_failed: AtomicU64::new(0),
-        }
+        })
     }
 
-    /// Health counters for `status` and the soak alerting.
+    /// Health counters for `status` and alerting.
     #[must_use]
     pub fn health(&self) -> PoolHealth {
         PoolHealth {
@@ -1039,29 +999,22 @@ impl UpstreamPool {
     /// or returns an error.
     pub async fn resolve(&self, query: &Message) -> Result<Message, Error> {
         let mut outgoing = query.clone();
-
-        // Ensure RD is set — we forward to recursive upstreams.
+        // We forward to recursive upstreams.
         outgoing.metadata.recursion_desired = true;
-
-        // Set the DO bit via EDNS.
         let mut edns = outgoing.edns.clone().unwrap_or_default();
         edns.set_dnssec_ok(true);
         outgoing.set_edns(edns);
 
         let original_id = query.metadata.id;
-        // Each send bounds every await inside it by this deadline, so no
-        // outer timeout is needed — and unlike an outer timeout, a hang
-        // inside a send is seen by the upstream's own failure handling
-        // (tear-down, reconnect, health counters), not just by the pool.
+        // Each send bounds every await inside it by this deadline, so a
+        // hang is seen by the upstream's own failure handling (tear-down,
+        // reconnect, health counters), not just by the pool.
         let deadline = Instant::now() + self.timeout;
 
-        // Each upstream leg runs as its own task, NOT as a racing future
-        // dropped when a sibling wins: a cancelled leg would abandon its
-        // failure handling mid-flight, so a slower upstream whose
-        // connection died would never notice (no failure counted, no
-        // tear-down, no repair) as long as a faster one kept answering.
-        // A detached leg always runs to its own conclusion; the race
-        // only decides whose answer the client gets.
+        // Each leg runs as its own task, NOT as a racing future dropped
+        // when a sibling wins: a cancelled leg would abandon its failure
+        // handling, so a slower upstream whose connection died would
+        // never notice as long as a faster one kept answering.
         let (tx, mut rx) = tokio::sync::mpsc::channel(self.upstreams.len());
         for upstream in &self.upstreams {
             let msg = outgoing.clone();
@@ -1074,13 +1027,10 @@ impl UpstreamPool {
         drop(tx);
 
         let mut errors = Vec::new();
-
         while let Some(result) = rx.recv().await {
             match result {
                 Ok(mut response) => {
-                    // send() already rejected unusable rcodes, so any
-                    // success here may win the race.
-                    // Stamp the original query id (DoQ may force id=0).
+                    // Stamp the original query id (DoQ forces id 0).
                     response.metadata.id = original_id;
                     self.resolved.fetch_add(1, Ordering::Relaxed);
                     self.consecutive_all_failed.store(0, Ordering::Relaxed);
@@ -1089,49 +1039,9 @@ impl UpstreamPool {
                 Err(e) => errors.push(e),
             }
         }
-
         self.all_failed_total.fetch_add(1, Ordering::Relaxed);
         self.consecutive_all_failed.fetch_add(1, Ordering::Relaxed);
         Err(Error::AllFailed(errors))
-    }
-
-    // ── Test-only constructor ───────────────────────────────────────
-
-    /// Build a pool from already-connected transports that never change.
-    #[cfg(test)]
-    fn from_transports(transports: Vec<Box<dyn Transport>>, timeout: Duration) -> Self {
-        let upstreams = transports
-            .into_iter()
-            .enumerate()
-            .map(|(i, transport)| {
-                let transport: Arc<dyn Transport> = Arc::from(transport);
-                let factory = tests::StaticFactory {
-                    transport: Arc::clone(&transport),
-                    label: format!("static-{i}"),
-                };
-                Arc::new(ReconnectingUpstream::with_transport(
-                    Box::new(factory),
-                    transport,
-                    timeout,
-                ))
-            })
-            .collect();
-        Self::assemble(upstreams, timeout)
-    }
-
-    /// Build a pool from transport factories, so a test can script
-    /// connection death and observe the rebuild.
-    #[cfg(test)]
-    async fn from_factories(factories: Vec<Box<dyn TransportFactory>>, timeout: Duration) -> Self {
-        let mut upstreams = Vec::with_capacity(factories.len());
-        for factory in factories {
-            upstreams.push(Arc::new(
-                ReconnectingUpstream::connect(factory, timeout)
-                    .await
-                    .expect("initial connect"),
-            ));
-        }
-        Self::assemble(upstreams, timeout)
     }
 }
 
@@ -1139,235 +1049,14 @@ impl UpstreamPool {
 use hickory_resolver::net::runtime::Spawn;
 
 // ── Tests ───────────────────────────────────────────────────────────
+//
+// Pool behaviour (races, reconnects, outages, health) is tested against
+// real DoH/DoQ servers in `tests/upstream.rs`. Here: URL parsing and
+// configuration rejection, which need no network.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    // ── Fake transports ─────────────────────────────────────────────
-
-    /// A fake transport that returns a fixed response after a delay.
-    struct FakeTransport {
-        delay: Duration,
-        /// If `Some`, return this error instead of a response.
-        error: Option<String>,
-        /// Response id to return (simulates `DoQ` id=0 behaviour).
-        response_id: u16,
-    }
-
-    impl FakeTransport {
-        fn ok(delay: Duration) -> Self {
-            Self {
-                delay,
-                error: None,
-                response_id: 0,
-            }
-        }
-
-        fn ok_with_id(delay: Duration, response_id: u16) -> Self {
-            Self {
-                delay,
-                error: None,
-                response_id,
-            }
-        }
-
-        fn failing(msg: &str) -> Self {
-            Self {
-                delay: Duration::ZERO,
-                error: Some(msg.to_owned()),
-                response_id: 0,
-            }
-        }
-    }
-
-    impl Transport for FakeTransport {
-        fn send_query(&self, msg: Message) -> BoxSendFuture<'_, Result<Message, SendError>> {
-            Box::pin(async move {
-                if self.delay > Duration::ZERO {
-                    tokio::time::sleep(self.delay).await;
-                }
-                if let Some(ref err) = self.error {
-                    return Err(SendError::Fatal(err.clone()));
-                }
-                let mut resp = Message::new(self.response_id, MessageType::Response, OpCode::Query);
-                // Echo back the query questions so the caller can verify.
-                for q in &msg.queries {
-                    resp.add_query(q.clone());
-                }
-                Ok(resp)
-            })
-        }
-    }
-
-    /// A factory that hands out the same transport forever.
-    pub(super) struct StaticFactory {
-        pub(super) transport: Arc<dyn Transport>,
-        pub(super) label: String,
-    }
-
-    impl TransportFactory for StaticFactory {
-        fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-            let transport = Arc::clone(&self.transport);
-            Box::pin(async move { Ok(transport) })
-        }
-
-        fn label(&self) -> &str {
-            &self.label
-        }
-    }
-
-    /// A transport that answers `healthy_sends` queries and then fails
-    /// every later one — hickory's dead-`DnsExchange` behaviour.
-    struct DiesAfter {
-        healthy_sends: usize,
-        sends: AtomicU64,
-    }
-
-    impl DiesAfter {
-        fn new(healthy_sends: usize) -> Self {
-            Self {
-                healthy_sends,
-                sends: AtomicU64::new(0),
-            }
-        }
-    }
-
-    impl Transport for DiesAfter {
-        fn send_query(&self, msg: Message) -> BoxSendFuture<'_, Result<Message, SendError>> {
-            let n = self.sends.fetch_add(1, Ordering::Relaxed);
-            let dead = n >= self.healthy_sends as u64;
-            Box::pin(async move {
-                if dead {
-                    return Err(SendError::Fatal("resource too busy".to_owned()));
-                }
-                let mut resp = Message::new(0, MessageType::Response, OpCode::Query);
-                for q in &msg.queries {
-                    resp.add_query(q.clone());
-                }
-                Ok(resp)
-            })
-        }
-    }
-
-    /// A factory whose every build produces a fresh [`DiesAfter`], and
-    /// which counts how many connections were built.
-    struct DyingFactory {
-        healthy_sends: usize,
-        builds: Arc<AtomicU64>,
-        label: &'static str,
-    }
-
-    impl TransportFactory for DyingFactory {
-        fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-            self.builds.fetch_add(1, Ordering::Relaxed);
-            let healthy_sends = self.healthy_sends;
-            Box::pin(
-                async move { Ok(Arc::new(DiesAfter::new(healthy_sends)) as Arc<dyn Transport>) },
-            )
-        }
-
-        fn label(&self) -> &str {
-            self.label
-        }
-    }
-
-    /// Echo the query back as a bare response.
-    fn echo_response(msg: &Message) -> Message {
-        let mut resp = Message::new(0, MessageType::Response, OpCode::Query);
-        for q in &msg.queries {
-            resp.add_query(q.clone());
-        }
-        resp
-    }
-
-    /// A transport whose liveness the test flips at will — the network
-    /// going away and coming back under a running daemon.
-    struct Flaky {
-        up: Arc<AtomicBool>,
-    }
-
-    impl Transport for Flaky {
-        fn send_query(&self, msg: Message) -> BoxSendFuture<'_, Result<Message, SendError>> {
-            let up = self.up.load(Ordering::Relaxed);
-            Box::pin(async move {
-                if up {
-                    Ok(echo_response(&msg))
-                } else {
-                    Err(SendError::Fatal("resource too busy".to_owned()))
-                }
-            })
-        }
-    }
-
-    struct FlakyFactory {
-        up: Arc<AtomicBool>,
-        label: &'static str,
-    }
-
-    impl TransportFactory for FlakyFactory {
-        fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-            let up = Arc::clone(&self.up);
-            Box::pin(async move { Ok(Arc::new(Flaky { up }) as Arc<dyn Transport>) })
-        }
-
-        fn label(&self) -> &str {
-            self.label
-        }
-    }
-
-    /// A factory that connects once and then refuses to build again.
-    struct BreaksAfterFirstBuild {
-        builds: Arc<AtomicU64>,
-        label: &'static str,
-    }
-
-    impl TransportFactory for BreaksAfterFirstBuild {
-        fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-            let n = self.builds.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                if n == 0 {
-                    Ok(Arc::new(DiesAfter::new(0)) as Arc<dyn Transport>)
-                } else {
-                    Err(Error::Init("connection refused".into()))
-                }
-            })
-        }
-
-        fn label(&self) -> &str {
-            self.label
-        }
-    }
-
-    use hickory_resolver::proto::op::{MessageType, OpCode};
-    use hickory_resolver::proto::rr::{Name, RecordType};
-
-    /// Build a test query Message with the given id.
-    fn test_query(id: u16) -> Message {
-        let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
-        msg.add_query(Query::query(
-            Name::from_ascii("example.com.").unwrap(),
-            RecordType::A,
-        ));
-        msg
-    }
-
-    /// A factory whose every `build` fails — an upstream that is
-    /// unreachable at startup (connection refused / timed out).
-    struct FailingFactory {
-        label: &'static str,
-    }
-
-    impl TransportFactory for FailingFactory {
-        fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-            Box::pin(async { Err(Error::Init("connection refused (test)".to_owned())) })
-        }
-
-        fn label(&self) -> &str {
-            self.label
-        }
-    }
 
     // ── URL validation tests ────────────────────────────────────────
 
@@ -1472,6 +1161,7 @@ mod tests {
             bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
             timeout_ms: 5000,
             extra_roots: Vec::new(),
+            connect_budget: DEFAULT_CONNECT_BUDGET,
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
         assert!(matches!(err, Error::Init(_)));
@@ -1484,6 +1174,7 @@ mod tests {
             bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
             timeout_ms: 0,
             extra_roots: Vec::new(),
+            connect_budget: DEFAULT_CONNECT_BUDGET,
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
         assert!(matches!(err, Error::Init(_)));
@@ -1496,6 +1187,7 @@ mod tests {
             bootstrap_ips: vec!["1.1.1.1".parse().unwrap()],
             timeout_ms: 5000,
             extra_roots: Vec::new(),
+            connect_budget: DEFAULT_CONNECT_BUDGET,
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
         assert!(matches!(err, Error::UnsupportedUrl(_)));
@@ -1508,796 +1200,9 @@ mod tests {
             bootstrap_ips: vec![],
             timeout_ms: 5000,
             extra_roots: Vec::new(),
+            connect_budget: DEFAULT_CONNECT_BUDGET,
         };
         let err = UpstreamPool::new(&cfg).await.unwrap_err();
         assert!(matches!(err, Error::Init(_)));
-    }
-
-    #[tokio::test]
-    async fn pool_comes_up_when_at_least_one_upstream_connects() {
-        // One upstream is dead at startup, one is live. The pool must
-        // come up (not crash), keep BOTH members (the dead one as a
-        // self-healing disconnected upstream), and resolve via the live
-        // one. This is the regression test for the Aug-21 outage, where
-        // a single unreachable upstream kept the whole pool from starting.
-        let good: Arc<dyn Transport> = Arc::new(FakeTransport::ok(Duration::from_millis(1)));
-        let factories: Vec<Box<dyn TransportFactory>> = vec![
-            Box::new(FailingFactory {
-                label: "dead-upstream",
-            }),
-            Box::new(StaticFactory {
-                transport: good,
-                label: "live-upstream".into(),
-            }),
-        ];
-        let pool = UpstreamPool::assemble_with_retry(
-            factories,
-            Duration::from_secs(5),
-            Duration::from_secs(2),
-        )
-        .await
-        .expect("pool must come up with one live upstream");
-
-        assert_eq!(
-            pool.upstreams.len(),
-            2,
-            "the dead upstream is kept, not dropped"
-        );
-
-        let resp = pool
-            .resolve(&test_query(4242))
-            .await
-            .expect("query resolves via the live upstream");
-        assert_eq!(resp.metadata.id, 4242);
-    }
-
-    #[tokio::test]
-    async fn pool_crashes_when_no_upstream_connects() {
-        // Every upstream is unreachable and the startup budget is spent:
-        // `new` must return Err (the process exits, systemd restarts it)
-        // rather than come up serving nothing.
-        let factories: Vec<Box<dyn TransportFactory>> = vec![
-            Box::new(FailingFactory { label: "dead-1" }),
-            Box::new(FailingFactory { label: "dead-2" }),
-        ];
-        let err =
-            UpstreamPool::assemble_with_retry(factories, Duration::from_secs(5), Duration::ZERO)
-                .await
-                .unwrap_err();
-        assert!(matches!(err, Error::Init(_)));
-    }
-
-    // ── Racing / timeout / AllFailed tests ──────────────────────────
-
-    #[tokio::test]
-    async fn first_ok_wins_fast_over_slow() {
-        let pool = UpstreamPool::from_transports(
-            vec![
-                Box::new(FakeTransport::ok(Duration::from_millis(200))),
-                Box::new(FakeTransport::ok(Duration::from_millis(10))),
-            ],
-            Duration::from_secs(5),
-        );
-
-        let query = test_query(42);
-
-        let start = tokio::time::Instant::now();
-        let resp = pool.resolve(&query).await.unwrap();
-        let elapsed = start.elapsed();
-
-        // The fast transport (10ms) should win well before the slow one (200ms).
-        assert!(elapsed < Duration::from_millis(150));
-        // Id should be stamped to the original query id.
-        assert_eq!(resp.metadata.id, 42);
-    }
-
-    #[tokio::test]
-    async fn response_id_stamped_from_query() {
-        // Simulate DoQ returning id=0.
-        let pool = UpstreamPool::from_transports(
-            vec![Box::new(FakeTransport::ok_with_id(
-                Duration::from_millis(1),
-                0,
-            ))],
-            Duration::from_secs(5),
-        );
-
-        let query = test_query(12345);
-
-        let resp = pool.resolve(&query).await.unwrap();
-        assert_eq!(resp.metadata.id, 12345);
-    }
-
-    #[tokio::test]
-    async fn do_bit_set_on_outgoing() {
-        /// A transport that captures whether the DO bit was set.
-        struct CaptureDo;
-
-        impl Transport for CaptureDo {
-            fn send_query(&self, msg: Message) -> BoxSendFuture<'_, Result<Message, SendError>> {
-                Box::pin(async move {
-                    let edns = msg
-                        .edns
-                        .as_ref()
-                        .expect("EDNS should be present on outgoing query");
-                    assert!(edns.flags().dnssec_ok, "DO bit should be set");
-                    Ok(Message::response(0, OpCode::Query))
-                })
-            }
-        }
-
-        let pool = UpstreamPool::from_transports(vec![Box::new(CaptureDo)], Duration::from_secs(5));
-
-        let query = test_query(1);
-        pool.resolve(&query).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn all_fail_returns_all_failed() {
-        let pool = UpstreamPool::from_transports(
-            vec![
-                Box::new(FakeTransport::failing("upstream-1 down")),
-                Box::new(FakeTransport::failing("upstream-2 down")),
-            ],
-            Duration::from_secs(5),
-        );
-
-        let query = test_query(1);
-
-        let err = pool.resolve(&query).await.unwrap_err();
-        match err {
-            Error::AllFailed(errs) => {
-                assert_eq!(errs.len(), 2);
-                assert!(errs.iter().any(|e| e.contains("upstream-1")));
-                assert!(errs.iter().any(|e| e.contains("upstream-2")));
-            }
-            other => panic!("expected AllFailed, got {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn timeout_triggers_when_transport_too_slow() {
-        let pool = UpstreamPool::from_transports(
-            vec![Box::new(FakeTransport::ok(Duration::from_secs(10)))],
-            Duration::from_millis(50), // 50ms timeout
-        );
-
-        let query = test_query(1);
-
-        let err = pool.resolve(&query).await.unwrap_err();
-        assert!(matches!(err, Error::AllFailed(_)));
-    }
-
-    #[tokio::test]
-    async fn one_fails_one_succeeds() {
-        let pool = UpstreamPool::from_transports(
-            vec![
-                Box::new(FakeTransport::failing("nope")),
-                Box::new(FakeTransport::ok(Duration::from_millis(1))),
-            ],
-            Duration::from_secs(5),
-        );
-
-        let query = test_query(99);
-
-        let resp = pool.resolve(&query).await.unwrap();
-        assert_eq!(resp.metadata.id, 99);
-    }
-
-    #[tokio::test]
-    async fn one_timeout_one_succeeds() {
-        let pool = UpstreamPool::from_transports(
-            vec![
-                Box::new(FakeTransport::ok(Duration::from_secs(10))), // will timeout
-                Box::new(FakeTransport::ok(Duration::from_millis(5))), // fast
-            ],
-            Duration::from_millis(50),
-        );
-
-        let query = test_query(77);
-
-        let resp = pool.resolve(&query).await.unwrap();
-        assert_eq!(resp.metadata.id, 77);
-    }
-
-    // ── Reconnection tests ──────────────────────────────────────────
-    //
-    // Regression cover for the 2026-08-20 shadow outage: a single
-    // long-lived `DnsExchange` died about an hour into the run and every
-    // later query returned `resource too busy`, so the daemon SERVFAILed
-    // for seven hours straight with no recovery path.
-
-    #[tokio::test]
-    async fn dead_connection_is_replaced_within_the_same_query() {
-        let builds = Arc::new(AtomicU64::new(0));
-        // Healthy for exactly one send, then dead like a closed exchange.
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(DyingFactory {
-                healthy_sends: 1,
-                builds: Arc::clone(&builds),
-                label: "dying",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        // First query rides the connection built at startup.
-        assert_eq!(pool.resolve(&test_query(1)).await.unwrap().metadata.id, 1);
-        assert_eq!(builds.load(Ordering::Relaxed), 1);
-
-        // The second query hits the now-dead connection. Before the fix
-        // this returned AllFailed forever; now it must reconnect and
-        // answer without the caller ever seeing a failure.
-        assert_eq!(pool.resolve(&test_query(2)).await.unwrap().metadata.id, 2);
-        assert_eq!(builds.load(Ordering::Relaxed), 2, "expected one rebuild");
-    }
-
-    #[tokio::test]
-    async fn recovery_is_sustained_over_many_queries() {
-        let builds = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(DyingFactory {
-                healthy_sends: 1,
-                builds: Arc::clone(&builds),
-                label: "dying",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        // Every connection dies after one send, so every query but the
-        // first must reconnect. None of them may fail.
-        for id in 1..=20u16 {
-            let resp = pool
-                .resolve(&test_query(id))
-                .await
-                .unwrap_or_else(|e| panic!("query {id} failed: {e}"));
-            assert_eq!(resp.metadata.id, id);
-        }
-        assert_eq!(builds.load(Ordering::Relaxed), 20);
-    }
-
-    #[tokio::test]
-    async fn healthy_connection_is_reused_not_rebuilt() {
-        let builds = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(DyingFactory {
-                healthy_sends: usize::MAX,
-                builds: Arc::clone(&builds),
-                label: "dying",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        for id in 1..=50u16 {
-            pool.resolve(&test_query(id)).await.unwrap();
-        }
-        // Connection reuse is the whole point of DoH/DoQ: one handshake.
-        assert_eq!(builds.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn reconnect_backoff_stops_hammering_a_down_upstream() {
-        let builds = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(BreaksAfterFirstBuild {
-                builds: Arc::clone(&builds),
-                label: "broken",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-        assert_eq!(builds.load(Ordering::Relaxed), 1);
-
-        // The startup connection is dead on arrival and rebuilds fail, so
-        // every query errors — but without a build attempt per query.
-        for id in 1..=10u16 {
-            assert!(pool.resolve(&test_query(id)).await.is_err());
-        }
-        let attempts = builds.load(Ordering::Relaxed);
-        assert!(
-            attempts < 10,
-            "backoff should suppress a build per query, saw {attempts}"
-        );
-
-        // Past the backoff window a fresh attempt is allowed again.
-        tokio::time::advance(MAX_RECONNECT_BACKOFF * 2).await;
-        assert!(pool.resolve(&test_query(99)).await.is_err());
-        assert!(builds.load(Ordering::Relaxed) > attempts);
-    }
-
-    #[tokio::test]
-    async fn health_surfaces_upstream_failures() {
-        let builds = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(BreaksAfterFirstBuild {
-                builds: Arc::clone(&builds),
-                label: "broken",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        assert!(pool.resolve(&test_query(1)).await.is_err());
-
-        let health = pool.health();
-        assert_eq!(health.upstreams.len(), 1);
-        assert_eq!(health.upstreams[0].url, "broken");
-        assert!(
-            !health.upstreams[0].connected,
-            "a dead upstream must report down"
-        );
-        assert_eq!(health.upstreams[0].queries, 1);
-        assert_eq!(health.upstreams[0].failures, 1);
-        assert!(health.upstreams[0].consecutive_failures >= 1);
-        assert_eq!(
-            health.upstreams[0].last_success_secs_ago, None,
-            "an upstream that never answered must not look recent"
-        );
-        // Pool level: the client got nothing, and that is the signal
-        // alerting keys off.
-        assert_eq!(health.resolved, 0);
-        assert_eq!(health.all_failed_total, 1);
-        assert_eq!(health.consecutive_all_failed, 1);
-    }
-
-    #[tokio::test]
-    async fn one_dead_upstream_does_not_stop_the_race() {
-        let pool = UpstreamPool::from_factories(
-            vec![
-                Box::new(BreaksAfterFirstBuild {
-                    builds: Arc::new(AtomicU64::new(0)),
-                    label: "broken",
-                }),
-                Box::new(DyingFactory {
-                    healthy_sends: usize::MAX,
-                    builds: Arc::new(AtomicU64::new(0)),
-                    label: "healthy",
-                }),
-            ],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        let resp = pool.resolve(&test_query(7)).await.unwrap();
-        assert_eq!(resp.metadata.id, 7);
-
-        // One upstream is hard-down, yet the pool answered: this is the
-        // shape that must NOT read as degraded, or the soak alert cries
-        // wolf every time Quad9 drops a connection.
-        let health = pool.health();
-        assert_eq!(health.resolved, 1);
-        assert_eq!(health.all_failed_total, 0);
-        assert_eq!(health.consecutive_all_failed, 0);
-    }
-
-    #[tokio::test]
-    async fn pool_failure_streak_clears_once_an_upstream_answers_again() {
-        let up = Arc::new(AtomicBool::new(true));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(FlakyFactory {
-                up: Arc::clone(&up),
-                label: "flaky",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        pool.resolve(&test_query(1)).await.unwrap();
-        assert_eq!(pool.health().consecutive_all_failed, 0);
-
-        // The network goes away: the send fails, the rebuild succeeds but
-        // the replacement cannot send either, so the client gets nothing.
-        up.store(false, Ordering::Relaxed);
-        assert!(pool.resolve(&test_query(2)).await.is_err());
-        assert!(pool.resolve(&test_query(3)).await.is_err());
-        let health = pool.health();
-        assert_eq!(health.consecutive_all_failed, 2);
-        assert_eq!(health.all_failed_total, 2);
-
-        // ...and comes back. Sit out the rebuild holddown earned during
-        // the outage: recovery is only visible on the next rebuild.
-        up.store(true, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        pool.resolve(&test_query(4)).await.unwrap();
-        let health = pool.health();
-        assert_eq!(
-            health.consecutive_all_failed, 0,
-            "the streak must clear on recovery, or status stays degraded forever"
-        );
-        assert_eq!(health.all_failed_total, 2, "the total stays cumulative");
-        assert_eq!(health.resolved, 2);
-        assert!(
-            health.upstreams[0].last_success_secs_ago.is_some(),
-            "an upstream that just answered must report a last success"
-        );
-    }
-
-    // ── Hypothesis evidence tests (2026-08-20 review) ───────────────
-
-    /// A transport that never answers: the peer accepted the connection
-    /// and then went silent (black-holed route, dead middlebox).
-    struct Hangs;
-
-    impl Transport for Hangs {
-        fn send_query(&self, _msg: Message) -> BoxSendFuture<'_, Result<Message, SendError>> {
-            Box::pin(async move {
-                std::future::pending::<()>().await;
-                unreachable!()
-            })
-        }
-    }
-
-    /// Build #0 hangs on every send; later builds are healthy.
-    struct HangsThenHealthy {
-        builds: Arc<AtomicU64>,
-        label: &'static str,
-    }
-
-    impl TransportFactory for HangsThenHealthy {
-        fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-            let n = self.builds.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                if n == 0 {
-                    Ok(Arc::new(Hangs) as Arc<dyn Transport>)
-                } else {
-                    Ok(Arc::new(DiesAfter::new(usize::MAX)) as Arc<dyn Transport>)
-                }
-            })
-        }
-
-        fn label(&self) -> &str {
-            self.label
-        }
-    }
-
-    /// H1: an upstream whose connection hangs silently until the query
-    /// deadline must be torn down and replaced, not reused forever.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn hung_connection_is_torn_down_and_replaced() {
-        let builds = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(HangsThenHealthy {
-                builds: Arc::clone(&builds),
-                label: "hung",
-            })],
-            Duration::from_millis(100),
-        )
-        .await;
-
-        // First query rides the hung connection into the deadline.
-        assert!(pool.resolve(&test_query(1)).await.is_err());
-
-        // The hang must count as a failure on this upstream (H5).
-        let health = pool.health();
-        assert!(
-            health.upstreams[0].failures >= 1,
-            "a timed-out query must count as an upstream failure, saw {}",
-            health.upstreams[0].failures
-        );
-
-        // Give the detached repair a moment, then the upstream must
-        // answer again — before the fix the hung transport was reused
-        // for every later query, failing all of them.
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        let resp = pool
-            .resolve(&test_query(2))
-            .await
-            .expect("upstream must recover after the hung connection is replaced");
-        assert_eq!(resp.metadata.id, 2);
-        assert!(
-            builds.load(Ordering::Relaxed) >= 2,
-            "the hung transport was never replaced"
-        );
-    }
-
-    /// A factory whose rebuilds take a while, like a real TLS handshake.
-    struct SlowRebuild {
-        builds_started: Arc<AtomicU64>,
-        builds_completed: Arc<AtomicU64>,
-        label: &'static str,
-    }
-
-    impl TransportFactory for SlowRebuild {
-        fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-            let n = self.builds_started.fetch_add(1, Ordering::Relaxed);
-            let completed = Arc::clone(&self.builds_completed);
-            Box::pin(async move {
-                if n == 0 {
-                    // Startup connection: dead on arrival.
-                    completed.fetch_add(1, Ordering::Relaxed);
-                    Ok(Arc::new(DiesAfter::new(0)) as Arc<dyn Transport>)
-                } else {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    completed.fetch_add(1, Ordering::Relaxed);
-                    Ok(Arc::new(DiesAfter::new(usize::MAX)) as Arc<dyn Transport>)
-                }
-            })
-        }
-
-        fn label(&self) -> &str {
-            self.label
-        }
-    }
-
-    /// H2: the repair of a broken upstream must survive the query that
-    /// triggered it being cancelled because a faster upstream won.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn repair_survives_cancellation_by_a_faster_upstream() {
-        let builds_started = Arc::new(AtomicU64::new(0));
-        let builds_completed = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![
-                Box::new(DyingFactory {
-                    healthy_sends: usize::MAX,
-                    builds: Arc::new(AtomicU64::new(0)),
-                    label: "fast-healthy",
-                }),
-                Box::new(SlowRebuild {
-                    builds_started: Arc::clone(&builds_started),
-                    builds_completed: Arc::clone(&builds_completed),
-                    label: "slow-rebuilder",
-                }),
-            ],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        // Each query is answered by the healthy upstream almost
-        // instantly, cancelling the loser mid-rebuild every time.
-        for id in 1..=10u16 {
-            pool.resolve(&test_query(id)).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        // Give any in-flight rebuild time to finish.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            builds_completed.load(Ordering::Relaxed) >= 2,
-            "the slower upstream's repair never completed: {} started, {} completed",
-            builds_started.load(Ordering::Relaxed),
-            builds_completed.load(Ordering::Relaxed),
-        );
-        let health = pool.health();
-        assert!(
-            health.upstreams[1].connected,
-            "the slower upstream must end up repaired"
-        );
-    }
-
-    /// H3: an upstream that accepts connections but fails every send
-    /// must not cost a fresh handshake per query.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failing_sends_do_not_cause_a_handshake_per_query() {
-        struct CountingFlakyFactory {
-            up: Arc<AtomicBool>,
-            builds: Arc<AtomicU64>,
-            label: &'static str,
-        }
-
-        impl TransportFactory for CountingFlakyFactory {
-            fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-                self.builds.fetch_add(1, Ordering::Relaxed);
-                let up = Arc::clone(&self.up);
-                Box::pin(async move { Ok(Arc::new(Flaky { up }) as Arc<dyn Transport>) })
-            }
-
-            fn label(&self) -> &str {
-                self.label
-            }
-        }
-
-        let up = Arc::new(AtomicBool::new(false));
-        let builds = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(CountingFlakyFactory {
-                up: Arc::clone(&up),
-                builds: Arc::clone(&builds),
-                label: "accepts-but-cannot-answer",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        for id in 1..=20u16 {
-            assert!(pool.resolve(&test_query(id)).await.is_err());
-        }
-        // 20 failed queries in well under the minimum backoff window
-        // must not have paid anywhere near 20 handshakes.
-        let n = builds.load(Ordering::Relaxed);
-        assert!(n <= 4, "handshake per query: {n} builds for 20 queries");
-    }
-
-    /// A recovered upstream must not inherit the 30s build-failure
-    /// backoff as its post-install holddown: once a build succeeds, the
-    /// applied holddown is capped at [`MAX_REBUILD_HOLDDOWN`].
-    #[tokio::test(start_paused = true)]
-    async fn recovered_upstream_is_not_held_down_by_outage_backoff() {
-        struct Script {
-            builds: Arc<AtomicU64>,
-            label: &'static str,
-        }
-
-        impl TransportFactory for Script {
-            fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-                let n = self.builds.fetch_add(1, Ordering::Relaxed);
-                Box::pin(async move {
-                    match n {
-                        // Startup connection: answers once, then dies.
-                        0 => Ok(Arc::new(DiesAfter::new(1)) as Arc<dyn Transport>),
-                        // Outage: six failed builds climb the ladder to 30s.
-                        1..=6 => Err(Error::Init("connection refused".into())),
-                        // Recovery, but this connection is dead on arrival:
-                        // no send succeeds before the next rebuild.
-                        7 => Ok(Arc::new(DiesAfter::new(0)) as Arc<dyn Transport>),
-                        _ => Ok(Arc::new(DiesAfter::new(usize::MAX)) as Arc<dyn Transport>),
-                    }
-                })
-            }
-
-            fn label(&self) -> &str {
-                self.label
-            }
-        }
-
-        let builds = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(Script {
-                builds: Arc::clone(&builds),
-                label: "outage-then-recovery",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        pool.resolve(&test_query(1)).await.unwrap();
-
-        // Outage: six failed builds climb the ladder to the 30s cap.
-        for id in 2..=7u16 {
-            assert!(pool.resolve(&test_query(id)).await.is_err());
-            tokio::time::advance(Duration::from_secs(31)).await;
-        }
-        // Recovery build: succeeds but dead on arrival, so the applied
-        // holddown (not any later reset) is what gates the next rebuild.
-        assert!(pool.resolve(&test_query(8)).await.is_err());
-        assert!(
-            builds.load(Ordering::Relaxed) >= 8,
-            "expected the scripted builds to be consumed, saw {}",
-            builds.load(Ordering::Relaxed)
-        );
-
-        // Rewind-free check: within one holddown cap of the last
-        // failure, the upstream must answer again — an outage-earned 30s
-        // backoff must not gate a now-working upstream.
-        tokio::time::advance(MAX_REBUILD_HOLDDOWN + Duration::from_millis(500)).await;
-        pool.resolve(&test_query(21))
-            .await
-            .expect("recovered upstream must answer within the holddown cap");
-    }
-
-    /// H4: a query-specific error (bad response for one query) must not
-    /// tear down an otherwise healthy multiplexed connection.
-    #[tokio::test]
-    async fn query_error_does_not_kill_the_connection() {
-        /// Errors the first send as query-specific, then answers.
-        struct BadAnswerOnce {
-            fired: AtomicBool,
-        }
-
-        impl Transport for BadAnswerOnce {
-            fn send_query(&self, msg: Message) -> BoxSendFuture<'_, Result<Message, SendError>> {
-                let first = !self.fired.swap(true, Ordering::Relaxed);
-                Box::pin(async move {
-                    if first {
-                        Err(SendError::Query("malformed response for this query".into()))
-                    } else {
-                        Ok(echo_response(&msg))
-                    }
-                })
-            }
-        }
-
-        struct CountingOnceFactory {
-            builds: Arc<AtomicU64>,
-            label: &'static str,
-        }
-
-        impl TransportFactory for CountingOnceFactory {
-            fn build(&self) -> BoxSendFuture<'_, Result<Arc<dyn Transport>, Error>> {
-                self.builds.fetch_add(1, Ordering::Relaxed);
-                Box::pin(async move {
-                    Ok(Arc::new(BadAnswerOnce {
-                        fired: AtomicBool::new(false),
-                    }) as Arc<dyn Transport>)
-                })
-            }
-
-            fn label(&self) -> &str {
-                self.label
-            }
-        }
-
-        let builds = Arc::new(AtomicU64::new(0));
-        let pool = UpstreamPool::from_factories(
-            vec![Box::new(CountingOnceFactory {
-                builds: Arc::clone(&builds),
-                label: "bad-answer-once",
-            })],
-            Duration::from_secs(5),
-        )
-        .await;
-
-        // The query that hit the bad answer fails...
-        assert!(pool.resolve(&test_query(1)).await.is_err());
-        // ...but the connection survives: the next query succeeds on it.
-        pool.resolve(&test_query(2)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            builds.load(Ordering::Relaxed),
-            1,
-            "a query-specific error must not cause a rebuild"
-        );
-        let health = pool.health();
-        assert_eq!(health.upstreams[0].failures, 1);
-        assert_eq!(health.upstreams[0].consecutive_failures, 0);
-    }
-
-    /// H5: an upstream whose answers are unusable (SERVFAIL) must not
-    /// read as healthy in the per-upstream counters.
-    #[tokio::test]
-    async fn unusable_answers_count_as_upstream_failures() {
-        /// Transport-level success carrying SERVFAIL every time.
-        struct AlwaysServfail;
-
-        impl Transport for AlwaysServfail {
-            fn send_query(&self, msg: Message) -> BoxSendFuture<'_, Result<Message, SendError>> {
-                Box::pin(async move {
-                    let mut resp = echo_response(&msg);
-                    resp.metadata.response_code =
-                        hickory_resolver::proto::op::ResponseCode::ServFail;
-                    Ok(resp)
-                })
-            }
-        }
-
-        let pool =
-            UpstreamPool::from_transports(vec![Box::new(AlwaysServfail)], Duration::from_secs(5));
-
-        for id in 1..=3u16 {
-            assert!(pool.resolve(&test_query(id)).await.is_err());
-        }
-
-        let health = pool.health();
-        assert_eq!(
-            health.upstreams[0].failures, 3,
-            "SERVFAIL answers must count as failures"
-        );
-        assert_eq!(health.upstreams[0].consecutive_failures, 3);
-        assert_eq!(
-            health.upstreams[0].last_success_secs_ago, None,
-            "an upstream that never gave a usable answer must not read healthy"
-        );
-    }
-
-    // ── Live network test (requires network, kept #[ignore]) ────────
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires network access to Cloudflare DoH"]
-    async fn live_doh_cloudflare() {
-        let cfg = UpstreamConfig {
-            urls: vec!["https://dns.cloudflare.com/dns-query".into()],
-            bootstrap_ips: vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()],
-            timeout_ms: 10_000,
-            extra_roots: Vec::new(),
-        };
-
-        let pool = UpstreamPool::new(&cfg).await.expect("pool init");
-
-        let query = test_query(1234);
-
-        let resp = pool.resolve(&query).await.expect("resolve");
-        assert_eq!(resp.metadata.id, 1234);
-        assert!(!resp.answers.is_empty(), "expected at least one A record");
     }
 }
