@@ -909,7 +909,7 @@ pub async fn serve<U: Upstream>(
                         let udp = std::sync::Arc::clone(&udp);
                         tokio::spawn(async move {
                             let response = p.handle(&request, peer.ip()).await;
-                            let max = usize::from(request.max_payload());
+                            let max = udp_payload_limit(&request);
                             match response.to_vec() {
                                 Ok(bytes) if bytes.len() <= max => {
                                     let _ = udp.send_to(&bytes, peer).await;
@@ -933,14 +933,26 @@ pub async fn serve<U: Upstream>(
 
         let p = std::sync::Arc::clone(&pipeline);
         let mut rx = shutdown.subscribe();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_TCP_CONNECTIONS));
         tasks.push(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = rx.changed() => break,
                     accepted = tcp.accept() => {
                         let Ok((stream, peer)) = accepted else { continue };
+                        // A connection costs a socket and a task for up to
+                        // the idle timeout: strangers get nothing, and the
+                        // household gets a bounded number.
+                        if !client_allowed(&p.policy().allow, peer.ip()) {
+                            continue;
+                        }
+                        let Ok(slot) = std::sync::Arc::clone(&slots).try_acquire_owned() else {
+                            tracing::warn!(%peer, "TCP connection cap reached; closing new connection");
+                            continue;
+                        };
                         let p = std::sync::Arc::clone(&p);
                         tokio::spawn(async move {
+                            let _slot = slot;
                             let _ = serve_tcp_conn(stream, peer.ip(), p).await;
                         });
                     }
@@ -957,7 +969,19 @@ pub async fn serve<U: Upstream>(
     })
 }
 
-/// One TCP connection: length-prefixed messages, 10s idle timeout.
+/// Concurrent TCP connections served; more are closed on accept.
+pub const MAX_TCP_CONNECTIONS: usize = 128;
+
+/// Largest UDP answer: the client's EDNS size, but never above the
+/// DNS Flag Day 2020 value of 1232 bytes (no IP fragmentation, no large
+/// reflected answers) and never below the classic 512.
+fn udp_payload_limit(request: &Message) -> usize {
+    usize::from(request.max_payload().clamp(512, 1232))
+}
+
+/// One TCP connection: length-prefixed messages; 10 s to send each
+/// query, 10 s to take each answer (a client that never reads cannot
+/// pin the task).
 async fn serve_tcp_conn<U: Upstream>(
     mut stream: tokio::net::TcpStream,
     peer: IpAddr,
@@ -987,7 +1011,12 @@ async fn serve_tcp_conn<U: Upstream>(
         let Ok(len) = u16::try_from(bytes.len()) else {
             return Ok(());
         };
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(&bytes).await?;
+        let mut framed = Vec::with_capacity(bytes.len() + 2);
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(&bytes);
+        match tokio::time::timeout(idle, stream.write_all(&framed)).await {
+            Ok(result) => result?,
+            Err(_) => return Ok(()), // the client stopped reading
+        }
     }
 }

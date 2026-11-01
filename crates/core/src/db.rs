@@ -562,10 +562,12 @@ fn process_batch_inner(
     for msg in batch {
         match msg {
             Msg::Event(LogEvent::Query(q)) => {
-                tx.execute(
+                // Cached statement: parsed once per connection, not per row.
+                tx.prepare_cached(
                     "INSERT INTO queries (ts, client, qname, qtype, verdict, rule, list, source, rcode, duration_us) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
+                )?
+                .execute(params![
                         q.ts,
                         q.client.to_string(),
                         q.qname,
@@ -576,8 +578,7 @@ fn process_batch_inner(
                         q.source.as_str(),
                         i64::from(q.rcode),
                         i64::from(q.duration_us),
-                    ],
-                )?;
+                    ])?;
             }
             Msg::Event(LogEvent::Divergence {
                 ts,

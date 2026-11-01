@@ -211,3 +211,101 @@ async fn a_genuinely_taken_port_still_fails_loudly_and_names_itself() {
         "the error must name the address: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// socket hardening
+// ---------------------------------------------------------------------------
+
+/// Read until EOF or 2 s: true when the server closed the connection.
+async fn closed_by_server(stream: &mut tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 16];
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
+#[tokio::test]
+async fn tcp_from_a_stranger_is_closed_without_an_answer() {
+    let pki = Arc::new(Pki::new());
+    let up = DnsUpstream::start(Arc::clone(&pki)).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Db::open(&tmp.path().join("e2e.sqlite")).unwrap();
+    let p = pipeline(&up, &pki, &db, "").await;
+    p.swap_policy(
+        SafeSearch::new::<&str>(false, &[]).unwrap(),
+        vec!["::1/128".parse::<IpNet>().unwrap()],
+    );
+    let server = serve(Arc::new(p), &["127.0.0.1:0".parse().unwrap()])
+        .await
+        .unwrap();
+    let mut s = tokio::net::TcpStream::connect(server.tcp_addrs[0])
+        .await
+        .unwrap();
+    assert!(closed_by_server(&mut s).await);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn tcp_connections_beyond_the_cap_are_closed() {
+    use sumidero_core::server::MAX_TCP_CONNECTIONS;
+    let env = start().await;
+    let addr = env.server.tcp_addrs[0];
+    let mut held = Vec::new();
+    for _ in 0..MAX_TCP_CONNECTIONS {
+        held.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
+    assert!(
+        closed_by_server(&mut extra).await,
+        "connection {} must be refused",
+        MAX_TCP_CONNECTIONS + 1
+    );
+    // Freeing one slot lets the next client in.
+    drop(held.pop());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        query_tcp(addr, "blocked.test", RecordType::A).await.rcode,
+        ResponseCode::NXDomain
+    );
+    env.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn udp_answers_never_exceed_1232_bytes_even_if_the_client_offers_more() {
+    let env = start().await;
+    let many: Vec<Ipv4Addr> = (0..120u8).map(|i| Ipv4Addr::new(10, 0, 1, i)).collect();
+    env.up.add_a("huge.test", &many);
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut msg = hickory_proto::op::Message::new(
+        9,
+        hickory_proto::op::MessageType::Query,
+        hickory_proto::op::OpCode::Query,
+    );
+    msg.add_query(hickory_proto::op::Query::query(
+        hickory_proto::rr::Name::from_ascii("huge.test.").unwrap(),
+        RecordType::A,
+    ));
+    msg.metadata.recursion_desired = true;
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_max_payload(4096);
+    msg.set_edns(edns);
+    sock.send_to(&msg.to_vec().unwrap(), env.server.udp_addrs[0])
+        .await
+        .unwrap();
+    let mut buf = [0u8; 8192];
+    let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(n <= 1232, "UDP answer of {n} bytes");
+    assert!(
+        hickory_proto::op::Message::from_vec(&buf[..n])
+            .unwrap()
+            .metadata
+            .truncation
+    );
+    env.server.shutdown().await;
+}
