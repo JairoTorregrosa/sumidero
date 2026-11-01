@@ -14,6 +14,7 @@
 pub mod cache;
 pub mod config;
 pub mod db;
+pub mod failcache;
 pub mod lists;
 pub mod safesearch;
 pub mod server;

@@ -32,19 +32,21 @@ pub fn run(config: &Path, json: bool, hours: u32) -> ExitCode {
         "cache_hits": stats.cache_hits,
         "stale_hits": stats.stale_hits,
         "upstream_failures": stats.upstream_failures,
+        "failure_cached": stats.failure_cached,
         "top_queried": stats.top_queried,
         "top_blocked": stats.top_blocked,
     });
     let human = format!(
         "last {hours}h: {} queries, {} blocked, {} excepted, {} safe-search rewrites, \
-         {} cache hits, {} stale hits, {} upstream failures",
+         {} cache hits, {} stale hits, {} upstream failures, {} held failures",
         stats.total,
         stats.blocked,
         stats.excepted,
         stats.rewritten,
         stats.cache_hits,
         stats.stale_hits,
-        stats.upstream_failures
+        stats.upstream_failures,
+        stats.failure_cached
     );
     emit(json, "stats", payload, &human)
 }

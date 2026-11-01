@@ -44,6 +44,62 @@ pub struct Config {
     pub safe_search: SafeSearchConfig,
     #[serde(default, skip_serializing_if = "TlsConfig::is_default")]
     pub tls: TlsConfig,
+    #[serde(default, skip_serializing_if = "CacheConfig::is_default")]
+    pub cache: CacheConfig,
+}
+
+/// Answer cache. Freshness always follows the published TTLs; these
+/// knobs only bound size and how long expired answers may be served
+/// while a refresh runs (RFC 8767).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Most answers kept (LRU beyond it; a 64 MB byte budget applies too).
+    #[serde(default = "CacheConfig::default_max_entries")]
+    pub max_entries: usize,
+    /// Seconds past its TTL an answer may still be served (with TTL 30)
+    /// while it is refreshed. 0 disables serving stale; at most 3 days.
+    #[serde(default = "CacheConfig::default_serve_stale_secs")]
+    pub serve_stale_secs: u64,
+}
+
+impl CacheConfig {
+    const fn default_max_entries() -> usize {
+        16_384
+    }
+
+    const fn default_serve_stale_secs() -> u64 {
+        crate::cache::DEFAULT_SERVE_STALE_SECS
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_entries == 0 {
+            return Err(ConfigError::Invalid(
+                "cache.max_entries must be at least 1".into(),
+            ));
+        }
+        if self.serve_stale_secs > crate::cache::MAX_SERVE_STALE_SECS {
+            return Err(ConfigError::Invalid(format!(
+                "cache.serve_stale_secs: {} exceeds the RFC 8767 bound of {} (3 days)",
+                self.serve_stale_secs,
+                crate::cache::MAX_SERVE_STALE_SECS
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: Self::default_max_entries(),
+            serve_stale_secs: Self::default_serve_stale_secs(),
+        }
+    }
 }
 
 /// Extra trust anchors for every TLS connection the daemon makes
@@ -314,6 +370,7 @@ impl Config {
             )));
         }
         self.tls.validate()?;
+        self.cache.validate()?;
         crate::safesearch::validate_providers(&self.safe_search.providers)
             .map_err(|e| ConfigError::Invalid(format!("safe_search.providers: {e}")))?;
         // filtering must yield at least one effective list
@@ -460,6 +517,13 @@ timeout_ms = 3000
 [database]
 # SQLite file for query log and stats (must be absolute).
 path = "/var/lib/sumidero/sumidero.sqlite"
+
+# Answer cache. Freshness always follows the published TTLs.
+# [cache]
+# max_entries = 16384
+# How long past its TTL an answer may be served (TTL 30) while it is
+# refreshed; 0 disables serving stale, at most 259200 (3 days).
+# serve_stale_secs = 43200
 "#
     )
 }

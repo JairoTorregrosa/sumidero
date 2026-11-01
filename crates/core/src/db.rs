@@ -85,16 +85,21 @@ pub enum ResponseSource {
     Upstream,
     /// Upstream failed and nothing cached: SERVFAIL to the client.
     Failed,
+    /// SERVFAIL from the resolution-failure cache (RFC 9520): the name
+    /// failed moments ago and the upstreams were not asked again.
+    FailureCached,
 }
 
 impl ResponseSource {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Synth => "synth",
             Self::Cache => "cache",
             Self::Stale => "stale",
             Self::Upstream => "upstream",
             Self::Failed => "failed",
+            Self::FailureCached => "failure_cached",
         }
     }
 
@@ -105,6 +110,7 @@ impl ResponseSource {
             "stale" => Ok(Self::Stale),
             "upstream" => Ok(Self::Upstream),
             "failed" => Ok(Self::Failed),
+            "failure_cached" => Ok(Self::FailureCached),
             other => Err(DbError::Sql(rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Text,
@@ -241,6 +247,8 @@ pub struct Stats {
     /// Expired entries served while a refresh ran (also answered locally).
     pub stale_hits: u64,
     pub upstream_failures: u64,
+    /// SERVFAILs answered from the resolution-failure cache.
+    pub failure_cached: u64,
     /// (qname, count), most-queried first.
     pub top_queried: Vec<(String, u64)>,
     /// (qname, count), most-blocked first.
@@ -808,24 +816,33 @@ impl Db {
         let conn = open_read_conn(&self.path)?;
 
         // One scan for every counter (the log holds 7 days of queries).
-        let (total, blocked, excepted, rewritten, cache_hits, stale_hits, upstream_failures) = conn
-            .query_row(
-                "SELECT COUNT(*),
+        let (
+            total,
+            blocked,
+            excepted,
+            rewritten,
+            cache_hits,
+            stale_hits,
+            upstream_failures,
+            failure_cached,
+        ) = conn.query_row(
+            "SELECT COUNT(*),
                         COALESCE(SUM(verdict = 'blocked'), 0),
                         COALESCE(SUM(verdict = 'excepted'), 0),
                         COALESCE(SUM(verdict = 'rewritten'), 0),
                         COALESCE(SUM(source = 'cache'), 0),
                         COALESCE(SUM(source = 'stale'), 0),
-                        COALESCE(SUM(source = 'failed'), 0)
+                        COALESCE(SUM(source = 'failed'), 0),
+                        COALESCE(SUM(source = 'failure_cached'), 0)
                  FROM queries WHERE ts >= ?1",
-                params![since_ts],
-                |r| {
-                    let n = |i: usize| -> rusqlite::Result<u64> {
-                        Ok(u64::try_from(r.get::<_, i64>(i)?).unwrap_or(0))
-                    };
-                    Ok((n(0)?, n(1)?, n(2)?, n(3)?, n(4)?, n(5)?, n(6)?))
-                },
-            )?;
+            params![since_ts],
+            |r| {
+                let n = |i: usize| -> rusqlite::Result<u64> {
+                    Ok(u64::try_from(r.get::<_, i64>(i)?).unwrap_or(0))
+                };
+                Ok((n(0)?, n(1)?, n(2)?, n(3)?, n(4)?, n(5)?, n(6)?, n(7)?))
+            },
+        )?;
 
         let top_list = |sql: &str| -> Result<Vec<(String, u64)>, DbError> {
             let mut stmt = conn.prepare(sql)?;
@@ -856,6 +873,7 @@ impl Db {
             cache_hits,
             stale_hits,
             upstream_failures,
+            failure_cached,
             top_queried,
             top_blocked,
         })
