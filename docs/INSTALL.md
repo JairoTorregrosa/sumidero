@@ -75,8 +75,9 @@ Then set, at minimum:
 - `filtering.list_dir` — `/var/lib/sumidero/lists`.
 - `database.path` — `/var/lib/sumidero/sumidero.sqlite`.
 
-Validate before starting. `check` parses the config and every list and
-reports the rule count; it never touches the running daemon:
+Validate before starting. `check` parses the config and every list it
+can find on disk (stored copies and `path` files) and reports the rule
+count; it never touches the network or the running daemon:
 
 ```sh
 sumidero --config /etc/sumidero/config.toml check
@@ -88,21 +89,37 @@ sumidero --config /etc/sumidero/config.toml check
 sudo systemctl enable --now sumidero
 ```
 
-The daemon fetches and compiles every list **before** it binds a socket,
-so it never serves unfiltered answers. At ~3.3M rules that takes about
-6 s. A list that cannot be fetched and has no stored copy is a fatal
+The daemon compiles every list **before** it binds a socket, so it never
+serves unfiltered answers. When every list has a stored copy it starts
+from those (about 4 s at ~3M rules on the reference SBC) and downloads
+right after; on the first start, or for a list added since, it downloads
+first. A list that cannot be fetched and has no stored copy is a fatal
 startup error, by design — refusing to start beats silently serving with
 filtering disabled.
+
+List hosts are resolved through the configured encrypted upstreams, not
+the host's resolver, so a filtering resolver on the host (Cloudflare
+Families, for one, answers `0.0.0.0` for `nsfw.oisd.nl`) cannot keep a
+list from refreshing.
+
+If an upstream or a list mirror uses a private CA, add its PEM:
+
+```toml
+[tls]
+extra_roots = ["/etc/sumidero/private-ca.pem"]
+```
 
 ## Operate
 
 ```sh
-# health: exit 0 healthy, 5 not running, 7 running but cannot resolve
+# health: exit 0 healthy, 5 not running, 7 degraded (degraded_reasons says why)
 sudo sumidero --config /etc/sumidero/config.toml status
 sudo sumidero --config /etc/sumidero/config.toml --json status
 
-# reload config, lists, allowlist and safe-search without dropping queries
-sudo systemctl reload sumidero        # SIGHUP
+# reload config, lists, allowlist and safe-search without dropping queries,
+# and wait for the outcome: exit 0 applied, 1 failed (old state kept), 8 no answer
+sudo sumidero --config /etc/sumidero/config.toml reload
+sudo systemctl reload sumidero        # plain SIGHUP, does not wait
 
 # why was this name blocked? (no sudo needed: filter-only, no database)
 sumidero --config /etc/sumidero/config.toml explain ads.example.com
@@ -116,12 +133,13 @@ journalctl -u sumidero -f
 ```
 
 `reload` re-reads the config file, re-fetches lists, and swaps the
-engine, allowlist and safe-search table atomically. A bad config or an
-unfetchable list leaves the running state untouched and logs loudly.
-Changes to `server.bind`, `[upstreams]` or `database.path` need a
-restart; the daemon says so when it sees them.
+engine, allowlist and safe-search table as one value. A bad config or an
+unfetchable new list leaves the running state untouched; `status` then
+reports `reload_failed` with the reason. Changes to `server.bind`,
+`[upstreams]`, `[database]`, `[tls]` or `[cache]` need a restart;
+`status` lists them under `pending_restart`.
 
-Lists also refresh on their own daily.
+Lists also refresh on their own daily, and hourly while one fails.
 
 ## Monitoring
 
@@ -131,11 +149,15 @@ alerting:
 | field | meaning |
 |---|---|
 | `running` | heartbeat is fresh |
-| `degraded` | running, but cannot resolve or is dropping log events |
+| `degraded` | running, with at least one entry in `degraded_reasons` |
+| `degraded_reasons[]` | `{reason, detail, next}`: `cannot_resolve`, `log_events_dropped`, `list_fetch_failed`, `list_stale`, `reload_failed`, `pending_restart` |
+| `lists[]` | each list in force: `origin`, `rules`, `verified_age_secs` |
+| `last_reload` | last load: `trigger`, `ok`, `error`, `duration_ms` |
 | `consecutive_all_upstreams_failed` | queries since any upstream last answered — non-zero means clients are getting SERVFAIL |
 | `log_events_dropped_recent` | events lost since the last sample — **this is the alertable one** |
 | `log_events_dropped` | lifetime total, diagnostic only (never goes back down) |
 | `upstreams[].last_success_secs_ago` | per-upstream last answer |
+| `upstreams[].state`, `last_error` | `connected` / `connecting` / `down`, and why |
 
 Alert on exit code 5 or 7:
 
@@ -152,7 +174,8 @@ Do **not** alert on `log_events_dropped` either. It is a lifetime total,
 so a single transient queue-full spike would pin the daemon degraded
 until the next restart. `degraded` keys off `log_events_dropped_recent`.
 
-Do **not** alert on `upstreams[].connected` being false. Connections are
+Do **not** alert on `upstreams[].connected` being false (or `state`
+being `down`). Connections are
 rebuilt lazily on the next query, so a healthy raced pool shows
 disconnected slots routinely — on the reference host one upstream reads
 disconnected a majority of the time while every query is answered. That
