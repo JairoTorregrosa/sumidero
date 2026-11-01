@@ -51,6 +51,7 @@ async fn fetcher_trusting(pki: &Pki, upstream: &DnsUpstream, trust: bool) -> Fet
         bootstrap_ips: vec![],
         timeout_ms: 3000,
         extra_roots: roots.clone(),
+        connect_budget: std::time::Duration::from_secs(5),
     })
     .await
     .unwrap();

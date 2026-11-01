@@ -34,6 +34,7 @@ async fn pipeline(up: &DnsUpstream, pki: &Pki, db: &Db, rules: &str) -> Pipeline
         bootstrap_ips: vec![],
         timeout_ms: 3000,
         extra_roots: roots,
+        connect_budget: std::time::Duration::from_secs(5),
     })
     .await
     .unwrap();

@@ -49,6 +49,7 @@ async fn fixture_with(rules: &str, safe_search: SafeSearch, timeout_ms: u64) -> 
         bootstrap_ips: vec![],
         timeout_ms,
         extra_roots: roots,
+        connect_budget: std::time::Duration::from_secs(5),
     })
     .await
     .unwrap();
