@@ -244,6 +244,8 @@ impl Config {
                 self.filtering.list_dir.display()
             )));
         }
+        crate::safesearch::validate_providers(&self.safe_search.providers)
+            .map_err(|e| ConfigError::Invalid(format!("safe_search.providers: {e}")))?;
         // filtering must yield at least one effective list
         let effective = self.effective_lists();
         if effective.is_empty() {

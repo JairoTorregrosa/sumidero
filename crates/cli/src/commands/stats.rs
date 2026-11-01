@@ -28,14 +28,23 @@ pub fn run(config: &Path, json: bool, hours: u32) -> ExitCode {
         "total": stats.total,
         "blocked": stats.blocked,
         "excepted": stats.excepted,
+        "rewritten": stats.rewritten,
         "cache_hits": stats.cache_hits,
+        "stale_hits": stats.stale_hits,
         "upstream_failures": stats.upstream_failures,
         "top_queried": stats.top_queried,
         "top_blocked": stats.top_blocked,
     });
     let human = format!(
-        "last {hours}h: {} queries, {} blocked, {} excepted, {} cache hits, {} upstream failures",
-        stats.total, stats.blocked, stats.excepted, stats.cache_hits, stats.upstream_failures
+        "last {hours}h: {} queries, {} blocked, {} excepted, {} safe-search rewrites, \
+         {} cache hits, {} stale hits, {} upstream failures",
+        stats.total,
+        stats.blocked,
+        stats.excepted,
+        stats.rewritten,
+        stats.cache_hits,
+        stats.stale_hits,
+        stats.upstream_failures
     );
     emit(json, "stats", payload, &human)
 }
