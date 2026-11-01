@@ -28,7 +28,7 @@ fn bench_lookup(c: &mut Criterion) {
                 Pattern::Wildcard { .. } => None,
             });
         }
-        builder.add_list(parsed.rules);
+        builder.add_list(&parsed.rules);
     }
     let engine = builder.build();
     let blocked = sample_blocked.expect("no exact/subtree rule found in lists");

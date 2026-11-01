@@ -16,7 +16,7 @@ fn verdict_for(rules: &str, name: &str) -> VerdictKind {
         parsed.issues
     );
     let mut builder = EngineBuilder::new();
-    builder.add_list(parsed.rules);
+    builder.add_list(&parsed.rules);
     let engine = builder.build();
     match engine.verdict(name) {
         Verdict::NoMatch => VerdictKind::NoMatch,

@@ -7,7 +7,7 @@ fn engine_of(lists: &[&str]) -> sumidero_filter::Engine {
     for list in lists {
         let parsed = parse_list(list);
         assert!(parsed.issues.is_empty(), "{:?}", parsed.issues);
-        builder.add_list(parsed.rules);
+        builder.add_list(&parsed.rules);
     }
     builder.build()
 }
@@ -110,7 +110,7 @@ fn streamed_add_matches_batch_add() {
     let mut batch = EngineBuilder::new();
     let parsed = parse_list(text);
     let batch_issues = parsed.issues.len();
-    batch.add_list(parsed.rules);
+    batch.add_list(&parsed.rules);
     let batch = batch.build();
 
     let mut streamed = EngineBuilder::new();

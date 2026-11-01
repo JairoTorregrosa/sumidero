@@ -12,7 +12,7 @@ fn build_engine(text: &str) -> (sumidero_filter::Engine, ParsedList) {
     let parsed = parse_list(text);
     let rules = parsed.rules.clone();
     let mut builder = EngineBuilder::new();
-    builder.add_list(rules);
+    builder.add_list(&rules);
     let engine = builder.build();
     (engine, parsed)
 }

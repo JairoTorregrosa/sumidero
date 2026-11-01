@@ -15,7 +15,7 @@ fn engine_from(text: &str) -> sumidero_filter::Engine {
         parsed.issues
     );
     let mut b = EngineBuilder::new();
-    b.add_list(parsed.rules);
+    b.add_list(&parsed.rules);
     b.build()
 }
 
@@ -280,8 +280,8 @@ fn verdict_list_index_first_list() {
     let list0 = parse_list("||alpha.com^");
     let list1 = parse_list("||beta.com^");
     let mut b = EngineBuilder::new();
-    let idx0 = b.add_list(list0.rules);
-    let _idx1 = b.add_list(list1.rules);
+    let idx0 = b.add_list(&list0.rules);
+    let _idx1 = b.add_list(&list1.rules);
     let e = b.build();
 
     if let Verdict::Block { list, .. } = e.verdict("alpha.com") {
@@ -296,8 +296,8 @@ fn verdict_list_index_second_list() {
     let list0 = parse_list("||alpha.com^");
     let list1 = parse_list("||beta.com^");
     let mut b = EngineBuilder::new();
-    let _idx0 = b.add_list(list0.rules);
-    let idx1 = b.add_list(list1.rules);
+    let _idx0 = b.add_list(&list0.rules);
+    let idx1 = b.add_list(&list1.rules);
     let e = b.build();
 
     if let Verdict::Block { list, .. } = e.verdict("beta.com") {
@@ -330,7 +330,7 @@ fn verdict_rule_line_with_preceding_comments() {
     assert_eq!(parsed.rules[0].line, 4);
 
     let mut b = EngineBuilder::new();
-    b.add_list(parsed.rules);
+    b.add_list(&parsed.rules);
     let e = b.build();
 
     if let Verdict::Block { rule, .. } = e.verdict("example.com") {
